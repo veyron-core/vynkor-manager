@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [develop, main]
+  pull_request:
+    branches: [develop, main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # dependency-direction guard (plan §8): the manager never depends on
+      # the kernel crate — an empty inverted tree must stay empty.
+      - name: No kernel dependency (C2 guard)
+        run: |
+          cargo tree -i veyron > /dev/null 2>&1 && {
+            echo "FAIL: vynkor-manager depends on the veyron kernel crate"
+            exit 1
+          } || echo "ok: no veyron dependency"
+
+      - name: Build
+        run: cargo build --all-features
+
+      - name: Tests
+        run: cargo test --all-features
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Format check
+        run: cargo fmt --check
