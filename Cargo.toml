@@ -1,0 +1,26 @@
+[package]
+name = "vynkor-manager"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85.0"
+description = "vynm — plugin marketplace manager for Veyron/vynkor: install, update, and manage kernel plugins from registries."
+license = "MIT"
+repository = "https://github.com/veyron-core/vynkor-manager"
+
+[lib]
+name = "vynkor_manager"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vynm"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+temp-env = "0.3"
