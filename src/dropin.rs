@@ -6,14 +6,14 @@ use crate::error::VynmError;
 use crate::state::remove_record;
 
 /// Base dir for installed plugins: `$VYNM_PLUGIN_DIR`, else the kernel's own
-/// default `$HOME/.local/lib/veyron/plugins` — vynm manages the same tree the
+/// default `$HOME/.local/lib/vyn/plugins` — vynm manages the same tree the
 /// kernel spawns from, so the fallback must stay byte-identical. `tmp_dir` is
 /// the fallback base when `$HOME` is unset (never shared `/tmp`, AUDIT M-09).
 pub fn plugin_dir(tmp_dir: &Path) -> PathBuf {
     std::env::var("VYNM_PLUGIN_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| match std::env::var("HOME") {
-            Ok(home) => PathBuf::from(home).join(".local/lib/veyron/plugins"),
+            Ok(home) => PathBuf::from(home).join(".local/lib/vyn/plugins"),
             Err(_) => tmp_dir.join("plugins"),
         })
 }
