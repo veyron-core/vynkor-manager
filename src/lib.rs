@@ -1,3 +1,4 @@
+pub mod cli;
 pub mod dropin;
 pub mod error;
 pub mod installer;
