@@ -31,9 +31,12 @@ semver = "1"
 veyron-wire = { version = "0.2.6", features = ["manifest"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 indicatif = "0.18"
+clap = { version = "4", features = ["derive"] }
+serde_yaml = "0.9"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [dev-dependencies]
 tempfile = "3"
 temp-env = "0.3"
-tokio = { version = "1", features = ["macros", "rt"] }
+
 mockito = "1"
