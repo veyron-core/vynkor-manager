@@ -1,6 +1,6 @@
 # vynkor-manager
 
-Plugin marketplace manager for [Veyron](https://github.com/veyron-core/vynkor)
+Plugin marketplace manager for [Veyron](https://github.com/vynkor-core/vynkor)
 (vynkor ecosystem). The binary is **`vynm`**: it installs, updates, and manages
 kernel plugins from registries — the extraction of the kernel's marketplace
 subsystem into a standalone tool (F1 / DC-1, see `docs/VYNM_ROADMAP.md` in the
@@ -26,7 +26,7 @@ Env overrides follow the manager namespace: `VYNM_STATE_DIR`,
 
 `vynkor-manager` never depends on the `veyron` kernel crate (CI asserts
 `cargo tree -i veyron` is empty); both depend on
-[`veyron-wire`](https://github.com/veyron-core/vynkor-wire) for shared types.
+[`vynkor-wire`](https://github.com/vynkor-core/vynkor-wire) for shared types.
 The kernel has no runtime awareness of vynm — drop-ins are just files.
 
 ## CLI

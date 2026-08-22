@@ -517,11 +517,11 @@ fn resolves_relative_archive_urls_against_base_url() {
     }];
     resolve_relative_archive_urls(
         &mut entries,
-        "https://raw.githubusercontent.com/veyron-core/vynkor-plugins/main/registry.json",
+        "https://raw.githubusercontent.com/vynkor-core/vynkor-plugins/main/registry.json",
     );
     assert_eq!(
         entries[0].archive_url,
-        "https://raw.githubusercontent.com/veyron-core/vynkor-plugins/main/dist/ai/versions/0.1.0/ai-0.1.0.zip"
+        "https://raw.githubusercontent.com/vynkor-core/vynkor-plugins/main/dist/ai/versions/0.1.0/ai-0.1.0.zip"
     );
 }
 
