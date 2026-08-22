@@ -13,7 +13,7 @@
 pub fn official_source() -> RegistrySource {
     RegistrySource {
         name: "official".into(),
-        url: "https://raw.githubusercontent.com/veyron-core/veyron-plugins/main/registry.json"
+        url: "https://raw.githubusercontent.com/veyron-core/vynkor-plugins/main/registry.json"
             .into(),
         public_key: Some(
             // offline maintainer key; rotate = re-sign entries + ship a new
