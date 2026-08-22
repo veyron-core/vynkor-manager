@@ -16,7 +16,7 @@ use crate::registry::{
 };
 use crate::source::RegistrySource;
 use crate::state::{load_state, record_install, InstalledEntry};
-use veyron_wire::manifest::validate_manifest;
+use vynkor_wire::manifest::validate_manifest;
 
 /// What `install` placed on disk, so the caller can write a per-plugin
 /// drop-in auto-spawn config (V-06 composes it with [`DropinParams`](crate::dropin::DropinParams)).
@@ -82,7 +82,7 @@ async fn preflight_kernel_version(entry: &RegistryEntry) -> Option<Version> {
         }
     };
     // advisory only — a mismatch warns, never blocks (D2)
-    if let Err(e) = veyron_wire::manifest::check_kernel_compatibility(
+    if let Err(e) = vynkor_wire::manifest::check_kernel_compatibility(
         &entry.slug,
         &entry.min_kernel_version,
         &entry.max_kernel_version,
@@ -257,7 +257,7 @@ pub async fn install(
     let manifest = match validate_manifest(
         &manifest_path,
         kernel_ver.as_ref(),
-        veyron_wire::manifest::default_resolver,
+        vynkor_wire::manifest::default_resolver,
     ) {
         Ok(m) => m,
         Err(e) => {
@@ -324,7 +324,7 @@ pub fn skip_reinstall(
     let manifest = validate_manifest(
         &dest.join("plugin.json"),
         None,
-        veyron_wire::manifest::default_resolver,
+        vynkor_wire::manifest::default_resolver,
     )
     .ok()?;
     Some(InstalledPlugin {
