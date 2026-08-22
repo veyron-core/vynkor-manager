@@ -26,7 +26,7 @@ fn write_plugin_config_creates_dropin_file() {
         &plugins_dir,
         &params(
             "ping-pong",
-            "/home/u/.local/lib/veyron/plugins/ping-pong/ping-pong"
+            "/home/u/.local/lib/vyn/plugins/ping-pong/ping-pong"
         )
     )
     .unwrap());
@@ -35,7 +35,7 @@ fn write_plugin_config_creates_dropin_file() {
     assert!(path.exists());
     let content = fs::read_to_string(&path).unwrap();
     assert!(content.contains("id: ping-pong"));
-    assert!(content.contains("binary: /home/u/.local/lib/veyron/plugins/ping-pong/ping-pong"));
+    assert!(content.contains("binary: /home/u/.local/lib/vyn/plugins/ping-pong/ping-pong"));
     assert!(content.contains("restart: on-failure"));
     assert!(content.contains("max_restarts: 5"));
     assert!(content.contains("sandbox: true"));

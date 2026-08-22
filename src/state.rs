@@ -18,7 +18,7 @@ fn default_source() -> String {
 }
 
 /// One recorded install in `installed.json` — the explicit state store that
-/// replaces filesystem-sniffing `~/.local/lib/veyron/plugins/<slug>` (R10-02).
+/// replaces filesystem-sniffing `~/.local/lib/vyn/plugins/<slug>` (R10-02).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InstalledEntry {
     pub slug: String,
@@ -78,13 +78,8 @@ pub fn state_dir(tmp_dir: &Path) -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
             std::env::var("XDG_DATA_HOME")
-                .map(|d| PathBuf::from(d).join("veyron"))
-                .unwrap_or_else(|_| {
-                    dirs_home(tmp_dir)
-                        .join(".local")
-                        .join("share")
-                        .join("veyron")
-                })
+                .map(|d| PathBuf::from(d).join("vyn"))
+                .unwrap_or_else(|_| dirs_home(tmp_dir).join(".local").join("share").join("vyn"))
         })
 }
 

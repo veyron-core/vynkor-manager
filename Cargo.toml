@@ -28,7 +28,7 @@ sha2 = "0.10"
 semver = "1"
 # shared plugin-manifest parsing/validation (single implementation, V-01);
 # the no-kernel-crate rule is untouched — wire is a separate crate
-vynkor-wire = { version = "0.0.1", features = ["manifest"] }
+vynkor-wire = { version = "0.0.2", features = ["manifest"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 indicatif = "0.18"
 clap = { version = "4", features = ["derive"] }
