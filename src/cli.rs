@@ -61,6 +61,11 @@ struct RawConfig {
     marketplace_public_key: Option<String>,
     #[serde(default)]
     registry_cache_ttl_secs: Option<u64>,
+    /// §7.3 consent knob for the single-source era: accept http:// transport
+    /// and unsigned content from the configured source in non-interactive
+    /// runs. Full per-source schema arrives with V-09 `registries:`.
+    #[serde(default)]
+    allow_unsigned: bool,
 }
 
 /// Resolve the drop-in plugin dir — ported verbatim from the kernel's
@@ -106,6 +111,7 @@ impl Ctx {
         if let Some(ttl) = raw.registry_cache_ttl_secs {
             source.cache_ttl_secs = ttl;
         }
+        source.allow_unsigned = raw.allow_unsigned;
         Ok(Self {
             plugins_dir: resolve_plugins_dir(config_path, raw.plugins_dir.as_deref()),
             source,
