@@ -15,4 +15,6 @@ pub enum VynmError {
     Cache(String),
     #[error("plugin not found: {0}")]
     PluginNotFound(String),
+    #[error("network error: {0}")]
+    Network(String),
 }
