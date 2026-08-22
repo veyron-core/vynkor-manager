@@ -127,8 +127,10 @@ fn hex_decode(s: &str) -> Result<Vec<u8>, VynmError> {
 /// `version` (not just `sha256`) prevents splicing a valid signature onto a
 /// different entry sharing the same archive hash; binding the full canonical
 /// entry closes the S1 gaps (status flips, archive_url redirects, loosened
-/// compat bounds all break it). Security boundary — ported verbatim.
-fn signed_message(entry: &RegistryEntry) -> String {
+/// compat bounds all break it). Security boundary — ported verbatim. pub:
+/// registry publishers (and the future `vynm sign`, V-14) must produce
+/// exactly this canonical form.
+pub fn signed_message(entry: &RegistryEntry) -> String {
     format!(
         "{}:{}:{}:{}:{}:{}:{}",
         entry.slug,

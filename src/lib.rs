@@ -1,5 +1,6 @@
 pub mod dropin;
 pub mod error;
+pub mod installer;
 pub mod registry;
 pub mod source;
 pub mod state;
