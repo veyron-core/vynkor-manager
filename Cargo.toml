@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.85.0"
 description = "vynm — plugin marketplace manager for Veyron/vynkor: install, update, and manage kernel plugins from registries."
 license = "MIT"
-repository = "https://github.com/veyron-core/vynkor-manager"
+repository = "https://github.com/vynkor-core/vynkor-manager"
 
 [lib]
 name = "vynkor_manager"
