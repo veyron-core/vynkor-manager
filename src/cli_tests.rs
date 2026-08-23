@@ -135,3 +135,56 @@ fn bare_slug_candidates_skips_disabled_and_unknown_origins() {
     let names: Vec<&str> = out.iter().map(|s| s.name.as_str()).collect();
     assert_eq!(names, vec!["a", "c"], "unconfigured origin falls through");
 }
+
+// ── V-10 confirmation gate: decision matrix + non-TTY refusal ───────────────
+
+fn gate_manifest() -> vynkor_wire::manifest::InstallManifest {
+    serde_json::from_str(
+        r#"{
+        "plugin_id": "guarded",
+        "version": "1.0.0",
+        "permissions": ["storage"],
+        "binary": "b",
+        "kernel_compatibility_range": {"min": "0.1.0", "max": "*"}
+    }"#,
+    )
+    .unwrap()
+}
+
+#[test]
+fn confirm_mode_pins_every_branch() {
+    use super::{confirm_mode, ConfirmMode};
+    // scripts get --yes
+    assert_eq!(confirm_mode(true, true), ConfirmMode::AutoYes);
+    assert_eq!(confirm_mode(true, false), ConfirmMode::AutoYes);
+    // TTY without --yes → interactive prompt
+    assert_eq!(confirm_mode(false, true), ConfirmMode::Interactive);
+    // non-TTY without --yes → refuse
+    assert_eq!(
+        confirm_mode(false, false),
+        ConfirmMode::NonInteractiveRefusal
+    );
+}
+
+#[test]
+fn non_tty_without_yes_refuses_with_actionable_error() {
+    let err = super::confirm_install(&gate_manifest(), false, false).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains(
+            "refusing to grant undeclared-review permissions in a non-interactive run \
+             — pass --yes to accept"
+        ),
+        "unexpected: {msg}"
+    );
+    // exit-code contract: generic failure until V-16 restructures classes
+    assert_eq!(super::exit_code(&err), super::EXIT_FAILURE);
+}
+
+#[test]
+fn yes_skips_gate_entirely_even_non_interactive() {
+    assert!(
+        super::confirm_install(&gate_manifest(), true, false).is_ok(),
+        "--yes must proceed without a prompt in any run mode"
+    );
+}

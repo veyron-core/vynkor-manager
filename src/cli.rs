@@ -3,17 +3,19 @@
 //! user-facing contract: subcommands take `--source <name>` from day one
 //! (§6.5 — adding sources later changes resolution logic, never grammar).
 
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use serde::Deserialize;
+use vynkor_wire::manifest::InstallManifest;
 
 use crate::dropin::{
     disable_plugin_config, enable_plugin_config, plugin_dir, remove_plugin_config, uninstall,
     write_plugin_config, DropinParams, Toggle,
 };
 use crate::error::VynmError;
-use crate::installer::install;
+use crate::installer::{format_permission_preview, install};
 use crate::registry::{fetch_registry, RegistryEntry};
 use crate::source::{official_source, RegistrySource};
 use crate::state::{format_ts, load_state};
@@ -268,6 +270,9 @@ pub enum Command {
         /// Registry source name (see the configured sources)
         #[arg(long)]
         source: Option<String>,
+        /// Skip the permission confirmation prompt (V-10) — for scripts/CI
+        #[arg(long)]
+        yes: bool,
     },
     /// Search the registry
     Search {
@@ -379,9 +384,11 @@ pub async fn run(cli: &Cli) -> Result<(), VynmError> {
     }
     let ctx = Ctx::load(&cli.config)?;
     match &cli.command {
-        Command::Install { slug, source } => {
+        Command::Install { slug, source, yes } => {
             let pinned = pin_source(&ctx, source.as_deref(), slug)?;
-            install_cmd(&ctx, pinned.as_ref(), slug).await.map(|_| ())
+            install_cmd(&ctx, pinned.as_ref(), slug, *yes)
+                .await
+                .map(|_| ())
         }
         Command::Search { query, source } => {
             let pinned = pin_source(&ctx, source.as_deref(), query)?;
@@ -496,10 +503,67 @@ async fn probe_sources(
     ))
 }
 
+// ── V-10 install confirmation gate ─────────────────────────────────────────
+
+/// Which path the permission gate takes. Pure decision so tests pin every
+/// branch without a TTY.
+#[derive(Debug, PartialEq, Eq)]
+enum ConfirmMode {
+    AutoYes,
+    Interactive,
+    NonInteractiveRefusal,
+}
+
+fn confirm_mode(explicit_yes: bool, interactive: bool) -> ConfirmMode {
+    if explicit_yes {
+        ConfirmMode::AutoYes
+    } else if interactive {
+        ConfirmMode::Interactive
+    } else {
+        ConfirmMode::NonInteractiveRefusal
+    }
+}
+
+/// The gate handed to [`install`]: previews the parsed staged manifest and
+/// asks the operator before anything user-visible happens. Default NO — only
+/// an explicit y/Y accepts (empty line = refusal). `interactive` is injected
+/// for tests; prod passes stdin's TTY status (§7.3 pattern).
+fn confirm_install(
+    manifest: &InstallManifest,
+    explicit_yes: bool,
+    interactive: bool,
+) -> Result<(), VynmError> {
+    match confirm_mode(explicit_yes, interactive) {
+        ConfirmMode::AutoYes => Ok(()),
+        ConfirmMode::NonInteractiveRefusal => Err(VynmError::Internal(
+            "refusing to grant undeclared-review permissions in a non-interactive run \
+             — pass --yes to accept"
+                .into(),
+        )),
+        ConfirmMode::Interactive => {
+            print!("{}", format_permission_preview(manifest));
+            println!(
+                "install {}@{} with the above permissions? [y/N] ",
+                manifest.plugin_id, manifest.version
+            );
+            std::io::stdout().flush().map_err(VynmError::Io)?;
+            let mut line = String::new();
+            match std::io::stdin().read_line(&mut line) {
+                Ok(_) if line.trim().eq_ignore_ascii_case("y") => Ok(()),
+                _ => Err(VynmError::Internal(format!(
+                    "install of '{}' refused by operator",
+                    manifest.plugin_id
+                ))),
+            }
+        }
+    }
+}
+
 async fn install_cmd(
     ctx: &Ctx,
     pinned: Option<&RegistrySource>,
     target: &str,
+    yes: bool,
 ) -> Result<ResolutionReceipt, VynmError> {
     let slug = split_target(target).map(|(_, s)| s).unwrap_or(target);
     let (src, entries) = match pinned {
@@ -537,6 +601,7 @@ async fn install_cmd(
         MAX_ARCHIVE_BYTES,
         MAX_EXTRACTED_BYTES,
         MAX_ARCHIVE_ENTRIES,
+        |manifest| confirm_install(manifest, yes, std::io::stdin().is_terminal()),
     )
     .await?;
 

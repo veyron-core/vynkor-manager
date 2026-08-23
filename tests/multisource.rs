@@ -204,7 +204,7 @@ async fn bare_slug_shadowing_picks_first_listed_and_prints_attribution() {
         &cfg,
         sb.dir.path(),
         &sb.dir.path().join("plugins"),
-        &["install", "database"],
+        &["install", "database", "--yes"],
     );
     assert!(ok, "install failed: {output}");
     assert!(
@@ -235,7 +235,9 @@ async fn explicit_form_bypasses_search_even_when_shadowed() {
         ("second", &url_b, true, true),
     ]));
 
-    sb.run(&["install", "second/database"]).await.unwrap();
+    sb.run(&["install", "second/database", "--yes"])
+        .await
+        .unwrap();
 
     let (source, sha) = sb.ledger_sha_of("database").expect("installed");
     assert_eq!(source, "second");
@@ -316,7 +318,7 @@ async fn ledger_origin_resolves_against_recorded_source_first() {
     )
     .unwrap();
 
-    sb.run(&["install", "database"]).await.unwrap();
+    sb.run(&["install", "database", "--yes"]).await.unwrap();
 
     let rec = vynkor_manager::state::load_state(sb.dir.path())
         .get("database")
@@ -342,7 +344,7 @@ async fn probe_skips_unreachable_source() {
         ("second", &url_b, true, true),
     ]));
 
-    sb.run(&["install", "database"]).await.unwrap();
+    sb.run(&["install", "database", "--yes"]).await.unwrap();
     let (source, _) = sb.ledger_sha_of("database").expect("installed");
     assert_eq!(source, "second");
 }
@@ -385,7 +387,7 @@ async fn allow_unsigned_is_per_source_during_probe() {
         ("open", &url_b, true, true),
     ]));
 
-    sb.run(&["install", "database"]).await.unwrap();
+    sb.run(&["install", "database", "--yes"]).await.unwrap();
     let (source, _) = sb.ledger_sha_of("database").expect("installed");
     assert_eq!(source, "open", "consent on 'corp' must not leak to 'open'");
 }
@@ -408,7 +410,7 @@ async fn disabled_sources_are_skipped_in_generic_order() {
         ("on", &url_on, true, true),
     ]));
 
-    sb.run(&["install", "database"]).await.unwrap();
+    sb.run(&["install", "database", "--yes"]).await.unwrap();
     let got = vynkor_manager::state::load_state(sb.dir.path())
         .get("database")
         .expect("installed")
@@ -417,7 +419,7 @@ async fn disabled_sources_are_skipped_in_generic_order() {
 
     // ...but explicit pinning still reaches a disabled source (operator
     // asked for it by name)
-    sb.run(&["install", "off/database"]).await.unwrap();
+    sb.run(&["install", "off/database", "--yes"]).await.unwrap();
     let got = vynkor_manager::state::load_state(sb.dir.path())
         .get("database")
         .expect("installed")
@@ -504,8 +506,10 @@ async fn list_filters_by_source_flag_and_validates_name() {
     let state_dir = sb.dir.path().to_path_buf();
     let plugin_dir = sb.dir.path().join("plugins");
 
-    sb.run(&["install", "logger"]).await.unwrap(); // bare → first
-    sb.run(&["install", "second/database"]).await.unwrap();
+    sb.run(&["install", "logger", "--yes"]).await.unwrap(); // bare → first
+    sb.run(&["install", "second/database", "--yes"])
+        .await
+        .unwrap();
 
     let (ok, out) = vynm(&cfg, &state_dir, &plugin_dir, &["list"]);
     assert!(ok);

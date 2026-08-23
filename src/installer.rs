@@ -16,7 +16,7 @@ use crate::registry::{
 };
 use crate::source::RegistrySource;
 use crate::state::{load_state, record_install, InstalledEntry};
-use vynkor_wire::manifest::validate_manifest;
+use vynkor_wire::manifest::{validate_manifest, InstallManifest};
 
 /// What `install` placed on disk, so the caller can write a per-plugin
 /// drop-in auto-spawn config (V-06 composes it with [`DropinParams`](crate::dropin::DropinParams)).
@@ -94,8 +94,15 @@ async fn preflight_kernel_version(entry: &RegistryEntry) -> Option<Version> {
 }
 
 /// Execute the atomic installation pipeline for a plugin entry:
-/// resolve → revoke-gate → signature → download → digest → extract → swap →
-/// validate → record. Drop-in writing stays with the caller (V-06).
+/// resolve → revoke-gate → signature → download → digest → extract →
+/// validate (staged copy) → permission-confirm gate (V-10) → swap → record.
+/// Drop-in writing stays with the caller (V-06).
+///
+/// V-10: `confirm` is the operator's consent gate, invoked with the parsed
+/// manifest of the STAGED copy before anything user-visible happens (dest
+/// swap, ledger record; drop-in is caller-side). An Err from the gate aborts
+/// exactly like a failed final validation: staging removed, dest/bak
+/// untouched, nothing recorded.
 #[allow(clippy::too_many_arguments)]
 pub async fn install(
     entries: &[RegistryEntry],
@@ -105,6 +112,7 @@ pub async fn install(
     max_archive_bytes: u64,
     max_extracted_bytes: u64,
     max_archive_entries: usize,
+    confirm: impl FnOnce(&InstallManifest) -> Result<(), VynmError>,
 ) -> Result<InstalledPlugin, VynmError> {
     // Step 1 — Resolve metadata
     let entry = entries
@@ -223,7 +231,32 @@ pub async fn install(
         return Err(e);
     }
 
-    // Step 7 — Atomic move to plugin directory
+    // Step 7 — Final validation of plugin.json, now BEFORE the swap (V-10
+    // reorder): the preview must come from the real parsed manifest, and a
+    // bad manifest then never touches dest at all. Kernel version comes from
+    // the pre-flight probe (Some → range checked; None → skipped per D2);
+    // the permission policy is the wire default_resolver.
+    let manifest = match validate_manifest(
+        &extract_dir.join("plugin.json"),
+        kernel_ver.as_ref(),
+        vynkor_wire::manifest::default_resolver,
+    ) {
+        Ok(m) => m,
+        Err(e) => {
+            let _ = fs::remove_dir_all(&stage_dir);
+            return Err(VynmError::Internal(e.to_string()));
+        }
+    };
+
+    // Step 8 — V-10 confirmation gate: everything below this line is
+    // user-visible (dest swap, ledger record; drop-in is caller-side), so the
+    // operator's consent lands here, after validation but before any rename.
+    if let Err(e) = confirm(&manifest) {
+        let _ = fs::remove_dir_all(&stage_dir);
+        return Err(e);
+    }
+
+    // Step 9 — Atomic move to plugin directory (post-gate failures still roll back)
     if let Err(e) = fs::create_dir_all(&plugin_base) {
         let _ = fs::remove_dir_all(&stage_dir);
         return Err(VynmError::Io(e));
@@ -249,26 +282,6 @@ pub async fn install(
         let _ = fs::remove_dir_all(&stage_dir);
         return Err(VynmError::Io(e));
     }
-
-    // Step 8 — Final validation of plugin.json. Kernel version comes from the
-    // pre-flight probe (Some → range checked; None → skipped per D2); the
-    // permission policy is the wire default_resolver.
-    let manifest_path = dest.join("plugin.json");
-    let manifest = match validate_manifest(
-        &manifest_path,
-        kernel_ver.as_ref(),
-        vynkor_wire::manifest::default_resolver,
-    ) {
-        Ok(m) => m,
-        Err(e) => {
-            let _ = fs::remove_dir_all(&dest);
-            if had_existing {
-                let _ = fs::rename(&bak, &dest);
-            }
-            let _ = fs::remove_dir_all(&stage_dir);
-            return Err(VynmError::Internal(e.to_string()));
-        }
-    };
 
     if had_existing {
         let _ = fs::remove_dir_all(&bak);
@@ -334,6 +347,29 @@ pub fn skip_reinstall(
         binary_path: dest.join(manifest.binary),
         sandbox_hint: manifest.sandbox.unwrap_or(true),
     })
+}
+
+/// V-10 — human-readable permission preview for the install confirmation
+/// gate: declared permissions plus every action's caller requirement (v2
+/// per-action permission, `unrestricted` when absent or legacy string).
+pub fn format_permission_preview(manifest: &InstallManifest) -> String {
+    let mut out = String::new();
+    if manifest.permissions.is_empty() {
+        out.push_str("permissions: (none)\n");
+    } else {
+        out.push_str(&format!(
+            "permissions: {}\n",
+            manifest.permissions.join(", ")
+        ));
+    }
+    for spec in manifest.actions.iter().flatten() {
+        out.push_str(&format!(
+            "  {} -> {}\n",
+            spec.name(),
+            spec.permission().unwrap_or("unrestricted")
+        ));
+    }
+    out
 }
 
 async fn download_with_progress(
