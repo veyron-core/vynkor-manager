@@ -186,6 +186,13 @@ pub enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Scaffold a new plugin project (V-20)
+    New {
+        name: String,
+        /// Overwrite files in an existing target dir
+        #[arg(long)]
+        force: bool,
+    },
     /// Sign (or with --verify, check) a registry entry over the canonical
     /// seven-field message (V-14)
     Sign {
@@ -223,11 +230,12 @@ pub enum Command {
 
 /// Dispatch a parsed invocation; errors bubble to main for exit-code mapping.
 pub async fn run(cli: &Cli) -> Result<(), VynmError> {
-    // keygen/sign are local crypto ops — no config file, no network
+    // keygen/sign/new are local ops — no config file, no network
     match &cli.command {
         Command::Keygen { name, out, force } => {
             return keygen_cmd(name.as_deref(), out.as_deref(), *force)
         }
+        Command::New { name, force } => return new_cmd(name, *force),
         Command::Sign {
             key,
             slug,
@@ -271,8 +279,8 @@ pub async fn run(cli: &Cli) -> Result<(), VynmError> {
         Command::Remove { slug } => remove_cmd(&ctx, slug),
         Command::Enable { slug } => enable_cmd(&ctx, slug),
         Command::Disable { slug } => disable_cmd(&ctx, slug),
-        // both handled above, before Ctx::load
-        Command::Keygen { .. } | Command::Sign { .. } => Ok(()),
+        // all handled above, before Ctx::load
+        Command::Keygen { .. } | Command::Sign { .. } | Command::New { .. } => Ok(()),
     }
 }
 
@@ -434,5 +442,17 @@ fn sign_cmd(
     }
     let key = crate::sign::load_signing_key(key_path)?;
     println!("{}", crate::sign::sign_entry(&key, &entry));
+    Ok(())
+}
+
+fn new_cmd(name: &str, force: bool) -> Result<(), VynmError> {
+    crate::scaffold::scaffold(Path::new("."), name, force)?;
+    eprintln!("scaffolded ./{name}/");
+    println!("next steps:");
+    println!("  cd {name}");
+    println!("  cargo build");
+    println!("  # package the archive, then sign the registry entry:");
+    println!("  vynm keygen <name> && vynm sign --key <name>.key --slug {name} --version 0.0.1 \\");
+    println!("    --sha256 <archive-sha256> --archive-url <url> --min 0.1.0");
     Ok(())
 }

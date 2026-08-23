@@ -1,0 +1,7 @@
+{
+  "plugin_id": "{{name}}",
+  "version": "0.0.1",
+  "permissions": [],
+  "binary": "{{name}}",
+  "kernel_compatibility_range": { "min": "0.1.0", "max": "*" }
+}
