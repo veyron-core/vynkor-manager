@@ -9,5 +9,6 @@ pub mod sign;
 pub mod source;
 pub mod state;
 pub mod validate;
+pub mod verify;
 
 pub use error::VynmError;

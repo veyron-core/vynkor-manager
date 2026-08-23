@@ -369,6 +369,7 @@ async fn pinned_bare_slug_tries_ledger_origin_first() {
             installed_at: 1,
             source_url: url_b.clone(),
             source: "second".into(),
+            tree_sha256: None,
         },
     )
     .unwrap();

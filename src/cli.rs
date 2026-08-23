@@ -290,6 +290,12 @@ pub enum Command {
     Enable { slug: String },
     /// Stop auto-spawning an installed plugin (drop-in renamed .disabled)
     Disable { slug: String },
+    /// Verify installed trees against the ledger's tree digests (V-13);
+    /// no slug = every ledger entry
+    Verify {
+        /// restrict the check to one installed plugin
+        slug: Option<String>,
+    },
     /// Generate an ed25519 signing key pair for registry publishing (V-14)
     Keygen {
         /// Name for the default output path (<name>.key)
@@ -397,6 +403,7 @@ pub async fn run(cli: &Cli) -> Result<(), VynmError> {
         Command::Remove { slug } => remove_cmd(&ctx, slug),
         Command::Enable { slug } => enable_cmd(&ctx, slug),
         Command::Disable { slug } => disable_cmd(&ctx, slug),
+        Command::Verify { slug } => crate::verify::verify_cmd(&ctx.tmp_dir, slug.as_deref()),
         // all handled above, before Ctx::load
         Command::Keygen { .. } | Command::Sign { .. } | Command::New { .. } => Ok(()),
     }

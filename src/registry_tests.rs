@@ -424,6 +424,7 @@ async fn cache_snapshots_installed_versions_per_plugin() {
         installed_at: 1_700_000_000,
         source_url: "https://registry.example".into(),
         source: "official".into(),
+        tree_sha256: None,
     });
 
     fetch_registry_from(&src, false, &cache, &installed)

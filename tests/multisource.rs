@@ -314,6 +314,7 @@ async fn ledger_origin_resolves_against_recorded_source_first() {
             installed_at: 1,
             source_url: url_b.clone(),
             source: "second".into(),
+            tree_sha256: None,
         },
     )
     .unwrap();

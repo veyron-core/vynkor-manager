@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -43,6 +44,63 @@ fn tmp_install_dir(base: &Path, slug: &str) -> PathBuf {
 
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn sha256_file(path: &Path) -> Result<String, VynmError> {
+    let bytes = fs::read(path)?;
+    Ok(hex_encode(&Sha256::digest(&bytes)))
+}
+
+/// Recursively gather (relpath, full path, is_dir); forward-slash relpaths,
+/// symlinks skipped entirely — extract_zip never creates them, so the digest
+/// must never see one either.
+fn collect_tree(
+    dir: &Path,
+    prefix: &str,
+    out: &mut Vec<(String, PathBuf, bool)>,
+) -> Result<(), VynmError> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let ft = entry.file_type()?;
+        if ft.is_symlink() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let rel = if prefix.is_empty() {
+            name
+        } else {
+            format!("{prefix}/{name}")
+        };
+        if ft.is_dir() {
+            out.push((rel.clone(), entry.path(), true));
+            collect_tree(&entry.path(), &rel, out)?;
+        } else {
+            out.push((rel, entry.path(), false));
+        }
+    }
+    Ok(())
+}
+
+/// V-13 canonical digest of an installed tree. Entries sorted by relpath;
+/// each file feeds `<relpath>\n<mode:o>\n<len>\n<sha256(file)>\n` with
+/// `mode & 0o7777` (exec-bit changes are tampering), each dir feeds
+/// `<relpath>/\n`. Computed once at install and re-checked by `vynm verify`.
+pub fn tree_digest(dir: &Path) -> Result<String, VynmError> {
+    let mut items: Vec<(String, PathBuf, bool)> = Vec::new();
+    collect_tree(dir, "", &mut items)?;
+    items.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut hasher = Sha256::new();
+    for (rel, full, is_dir) in items {
+        if is_dir {
+            hasher.update(format!("{rel}/\n"));
+            continue;
+        }
+        let meta = fs::metadata(&full)?;
+        let mode = meta.permissions().mode() & 0o7777;
+        let file_hash = sha256_file(&full)?;
+        hasher.update(format!("{rel}\n{mode:o}\n{}\n{file_hash}\n", meta.len()));
+    }
+    Ok(hex_encode(&hasher.finalize()))
 }
 
 /// D2 pre-flight: ask the local kernel for its version so manifest compat can
@@ -256,6 +314,16 @@ pub async fn install(
         return Err(e);
     }
 
+    // V-13 — tree digest over the staged copy BEFORE the swap: the bytes
+    // renamed into dest are exactly what gets recorded.
+    let tree_sha256 = match tree_digest(&extract_dir) {
+        Ok(h) => Some(h),
+        Err(e) => {
+            let _ = fs::remove_dir_all(&stage_dir);
+            return Err(e);
+        }
+    };
+
     // Step 9 — Atomic move to plugin directory (post-gate failures still roll back)
     if let Err(e) = fs::create_dir_all(&plugin_base) {
         let _ = fs::remove_dir_all(&stage_dir);
@@ -303,6 +371,7 @@ pub async fn install(
                 .unwrap_or(0),
             source_url: source.url.clone(),
             source: source.name.clone(),
+            tree_sha256,
         },
     )?;
 
@@ -340,6 +409,19 @@ pub fn skip_reinstall(
         vynkor_wire::manifest::default_resolver,
     )
     .ok()?;
+    // V-13 — repair path stays honest: re-digest the tree that is actually
+    // on disk and refresh the record, so `verify` never blesses a stale
+    // baseline after a same-version reinstall repaired the dir.
+    if let Ok(actual) = tree_digest(dest) {
+        if tracked.tree_sha256.as_deref() != Some(actual.as_str()) {
+            let mut updated = tracked.clone();
+            updated.tree_sha256 = Some(actual);
+            // best-effort: a failed refresh warns but must not fail the skip
+            if let Err(e) = record_install(tmp_dir, updated) {
+                tracing::warn!("could not refresh tree digest for '{slug}': {e}");
+            }
+        }
+    }
     Some(InstalledPlugin {
         slug: slug.to_string(),
         plugin_id: manifest.plugin_id,
