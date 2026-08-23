@@ -450,6 +450,7 @@ async fn skip_reinstall_when_same_version_and_dir_present() {
             installed_at: 1,
             source_url: "https://registry.example".into(),
             source: "official".into(),
+            tree_sha256: None,
         },
     )
     .unwrap();
@@ -472,6 +473,7 @@ async fn skip_reinstall_when_dir_missing_repairs_via_install() {
             installed_at: 1,
             source_url: "https://r.example".into(),
             source: "official".into(),
+            tree_sha256: None,
         },
     )
     .unwrap();
@@ -495,6 +497,7 @@ async fn skip_reinstall_on_version_bump() {
             installed_at: 1,
             source_url: "https://r.example".into(),
             source: "official".into(),
+            tree_sha256: None,
         },
     )
     .unwrap();
