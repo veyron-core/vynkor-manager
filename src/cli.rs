@@ -196,9 +196,10 @@ pub enum Command {
     /// Sign (or with --verify, check) a registry entry over the canonical
     /// seven-field message (V-14)
     Sign {
-        /// Path to the hex-seed key file (from `vynm keygen`)
+        /// Path to the hex-seed key file (from `vynm keygen`); required for
+        /// signing, unused with --verify
         #[arg(long)]
-        key: PathBuf,
+        key: Option<PathBuf>,
         #[arg(long)]
         slug: String,
         #[arg(long)]
@@ -250,7 +251,7 @@ pub async fn run(cli: &Cli) -> Result<(), VynmError> {
             signature,
         } => {
             return sign_cmd(
-                key,
+                key.as_deref(),
                 slug,
                 version,
                 sha256,
@@ -419,7 +420,7 @@ fn keygen_cmd(name: Option<&str>, out: Option<&Path>, force: bool) -> Result<(),
 
 #[allow(clippy::too_many_arguments)]
 fn sign_cmd(
-    key_path: &Path,
+    key_path: Option<&Path>,
     slug: &str,
     version: &str,
     sha256: &str,
@@ -434,12 +435,23 @@ fn sign_cmd(
     let entry =
         crate::sign::entry_from_fields(slug, version, sha256, status, archive_url, min, max);
     if verify {
+        if let Some(p) = key_path {
+            eprintln!(
+                "note: secret key not needed for verification — '{}' unused",
+                p.display()
+            );
+        }
         let sig = signature.expect("clap enforces --signature with --verify");
         let pk = public_key.expect("clap enforces --public-key with --verify");
         crate::sign::verify_signature(&entry, sig, pk)?;
         println!("✓ signature valid for {slug}@{version}");
         return Ok(());
     }
+    let Some(key_path) = key_path else {
+        return Err(VynmError::InvalidInput(
+            "--key <file> is required for signing (verification mode does not need it)".into(),
+        ));
+    };
     let key = crate::sign::load_signing_key(key_path)?;
     println!("{}", crate::sign::sign_entry(&key, &entry));
     Ok(())
@@ -456,3 +468,7 @@ fn new_cmd(name: &str, force: bool) -> Result<(), VynmError> {
     println!("    --sha256 <archive-sha256> --archive-url <url> --min 0.1.0");
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "cli_tests.rs"]
+mod tests;
