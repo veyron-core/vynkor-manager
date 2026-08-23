@@ -15,7 +15,7 @@ use crate::dropin::{
     write_plugin_config, DropinParams, Toggle,
 };
 use crate::error::VynmError;
-use crate::installer::{format_permission_preview, install};
+use crate::installer::{format_permission_preview, install, install_archive, ArchiveOrigin};
 use crate::registry::{fetch_registry, RegistryEntry};
 use crate::source::{official_source, RegistrySource};
 use crate::state::{format_ts, load_state};
@@ -263,7 +263,11 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Install a plugin from a registry into the kernel's plugin tree
+    /// Install a plugin from a registry, or a local archive / direct archive
+    /// URL (V-15). Ambiguity rule: an argument starting with http(s)://,
+    /// `./`, `../` or `/`, or ending in `.zip`, is an ARCHIVE install;
+    /// anything else is `[<source>/]<slug>[@<version>]` against registries.
+    /// Archives are not versioned — `./x.zip@1.0` is a hard error.
     Install {
         slug: String,
         /// Registry source name (see the configured sources)
@@ -272,6 +276,10 @@ pub enum Command {
         /// Skip the permission confirmation prompt (V-10) — for scripts/CI
         #[arg(long)]
         yes: bool,
+        /// V-15 archive installs only: accept insecure http:// direct archive
+        /// URLs (the archive-mode equivalent of allow_unsigned on a source)
+        #[arg(long)]
+        allow_unsigned: bool,
     },
     /// Search the registry
     Search {
@@ -389,12 +397,28 @@ pub async fn run(cli: &Cli) -> Result<(), VynmError> {
     }
     let ctx = Ctx::load(&cli.config)?;
     match &cli.command {
-        Command::Install { slug, source, yes } => {
-            let pinned = pin_source(&ctx, source.as_deref(), slug)?;
-            install_cmd(&ctx, pinned.as_ref(), slug, *yes)
-                .await
-                .map(|_| ())
-        }
+        Command::Install {
+            slug,
+            source,
+            yes,
+            allow_unsigned,
+        } => match classify_install_target(slug)? {
+            // V-15 archive mode: no registry resolution, --source is a misuse
+            InstallKind::Archive => {
+                if source.is_some() {
+                    return Err(VynmError::InvalidInput(
+                        "--source does not apply to local-archive/direct-URL installs".into(),
+                    ));
+                }
+                install_archive_cmd(&ctx, slug, *allow_unsigned, *yes).await
+            }
+            InstallKind::Registry => {
+                let pinned = pin_source(&ctx, source.as_deref(), slug)?;
+                install_cmd(&ctx, pinned.as_ref(), slug, *yes)
+                    .await
+                    .map(|_| ())
+            }
+        },
         Command::Search { query, source } => {
             let pinned = pin_source(&ctx, source.as_deref(), query)?;
             search_cmd(&ctx, pinned.as_ref(), query).await.map(|_| ())
@@ -454,6 +478,40 @@ fn parse_target(target: &str) -> Target<'_> {
         slug,
         version,
     }
+}
+
+/// V-15 install-target kind: registry flow or archive flow.
+#[derive(Debug, PartialEq, Eq)]
+enum InstallKind {
+    Registry,
+    Archive,
+}
+
+/// V-15 disambiguation — [`parse_target`] is consulted FIRST and its pin
+/// split reused; an argument carrying ANY archive indicator
+/// (`http://`/`https://` prefix, `./`/`../`/`/` path prefix, `.zip` suffix)
+/// routes to the archive pipeline instead of registries, while everything
+/// else stays `[<source>/]<slug>[@<version>]` untouched. An `@<version>` pin
+/// combined with archive mode is a hard error — archives are not versioned.
+/// The check runs on the RAW argument: `corp/slug.zip` ends in .zip and is a
+/// local archive, not source `corp`.
+fn classify_install_target(target: &str) -> Result<InstallKind, VynmError> {
+    let parsed = parse_target(target);
+    let is_archive = target.starts_with("http://")
+        || target.starts_with("https://")
+        || target.starts_with("./")
+        || target.starts_with("../")
+        || target.starts_with('/')
+        || target.ends_with(".zip");
+    if !is_archive {
+        return Ok(InstallKind::Registry);
+    }
+    if parsed.version.is_some() {
+        return Err(VynmError::InvalidInput(format!(
+            "'{target}': archives are not versioned — drop the @<version> pin"
+        )));
+    }
+    Ok(InstallKind::Archive)
 }
 
 /// (--source flag, target) → explicitly pinned source, or None = generic
@@ -749,6 +807,61 @@ async fn install_cmd(
     Ok(ResolutionReceipt {
         source_name: src.name,
     })
+}
+
+/// V-15 — archive-mode install: local zip or direct URL, no registry involved.
+/// Same gate/swap/record tail as [`install_cmd`]; the ledger records
+/// `source: "local"` so V-12 update resolution can exclude these installs.
+async fn install_archive_cmd(
+    ctx: &Ctx,
+    origin: &str,
+    allow_unsigned: bool,
+    yes: bool,
+) -> Result<(), VynmError> {
+    let kind = if origin.starts_with("http://") || origin.starts_with("https://") {
+        ArchiveOrigin::DirectUrl(origin.to_string())
+    } else {
+        let path = PathBuf::from(origin);
+        if !path.is_file() {
+            return Err(VynmError::InvalidInput(format!("'{origin}': no such file")));
+        }
+        ArchiveOrigin::LocalPath(path)
+    };
+
+    let installed = install_archive(
+        &kind,
+        &ctx.tmp_dir,
+        MAX_ARCHIVE_BYTES,
+        MAX_EXTRACTED_BYTES,
+        MAX_ARCHIVE_ENTRIES,
+        allow_unsigned,
+        |manifest| confirm_install(manifest, yes, std::io::stdin().is_terminal()),
+    )
+    .await?;
+
+    // D3: the manifest's own hint decides the drop-in default (same as registry installs)
+    let params = DropinParams {
+        slug: &installed.slug,
+        plugin_id: &installed.plugin_id,
+        binary_path: &installed.binary_path,
+        sandbox: installed.sandbox_hint,
+    };
+    let written = write_plugin_config(&ctx.plugins_dir, &params)?;
+    match written {
+        true => println!(
+            "   Auto-spawn entry: {}",
+            ctx.plugins_dir
+                .join(format!("{}.yaml", installed.slug))
+                .display()
+        ),
+        false => println!(
+            "   drop-in {} already exists — left untouched",
+            ctx.plugins_dir
+                .join(format!("{}.yaml", installed.slug))
+                .display()
+        ),
+    }
+    Ok(())
 }
 
 /// search hits for a lowercased query — shared by the probe predicate and

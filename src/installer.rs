@@ -266,10 +266,49 @@ pub async fn install(
         )));
     }
 
+    // Steps 6–9 — extract → validate → gate → digest → swap → record (shared
+    // with the V-15 archive pipeline; identical security boundaries).
+    commit_staged(
+        tmp_dir,
+        &stage_dir,
+        &entry.slug,
+        kernel_ver.as_ref(),
+        actual_hash,
+        &source.name,
+        &source.url,
+        max_extracted_bytes,
+        max_archive_entries,
+        confirm,
+    )
+}
+
+/// Shared tail of both install pipelines (registry V-05, local-archive V-15):
+/// the archive bytes are already written to `<stage_dir>/<slug>.zip` and their
+/// sha256 computed. Extracts (zip-slip guarded), validates the manifest on the
+/// STAGED copy, runs the V-10 permission gate, digests the tree (V-13),
+/// atomically swaps into the plugin dir (bak/rename) and records the ledger.
+/// Every failure below the extract removes staging and leaves dest untouched.
+#[allow(clippy::too_many_arguments)]
+fn commit_staged(
+    tmp_dir: &Path,
+    stage_dir: &Path,
+    slug: &str,
+    kernel_ver: Option<&Version>,
+    actual_hash: String,
+    source_name: &str,
+    source_url: &str,
+    max_extracted_bytes: u64,
+    max_archive_entries: usize,
+    confirm: impl FnOnce(&InstallManifest) -> Result<(), VynmError>,
+) -> Result<InstalledPlugin, VynmError> {
+    let plugin_base = plugin_dir(tmp_dir);
+    let dest = plugin_base.join(slug);
+    let archive_path = stage_dir.join(format!("{slug}.zip"));
+
     // Step 6 — Extract to temporary folder (zip-slip protection)
     let extract_dir = stage_dir.join("extracted");
     if let Err(e) = fs::create_dir_all(&extract_dir) {
-        let _ = fs::remove_dir_all(&stage_dir);
+        let _ = fs::remove_dir_all(stage_dir);
         return Err(VynmError::Io(e));
     }
 
@@ -285,7 +324,7 @@ pub async fn install(
         max_archive_entries,
         allowlist.as_ref(),
     ) {
-        let _ = fs::remove_dir_all(&stage_dir);
+        let _ = fs::remove_dir_all(stage_dir);
         return Err(e);
     }
 
@@ -296,12 +335,12 @@ pub async fn install(
     // the permission policy is the wire default_resolver.
     let manifest = match validate_manifest(
         &extract_dir.join("plugin.json"),
-        kernel_ver.as_ref(),
+        kernel_ver,
         vynkor_wire::manifest::default_resolver,
     ) {
         Ok(m) => m,
         Err(e) => {
-            let _ = fs::remove_dir_all(&stage_dir);
+            let _ = fs::remove_dir_all(stage_dir);
             return Err(VynmError::Internal(e.to_string()));
         }
     };
@@ -310,7 +349,7 @@ pub async fn install(
     // user-visible (dest swap, ledger record; drop-in is caller-side), so the
     // operator's consent lands here, after validation but before any rename.
     if let Err(e) = confirm(&manifest) {
-        let _ = fs::remove_dir_all(&stage_dir);
+        let _ = fs::remove_dir_all(stage_dir);
         return Err(e);
     }
 
@@ -319,18 +358,18 @@ pub async fn install(
     let tree_sha256 = match tree_digest(&extract_dir) {
         Ok(h) => Some(h),
         Err(e) => {
-            let _ = fs::remove_dir_all(&stage_dir);
+            let _ = fs::remove_dir_all(stage_dir);
             return Err(e);
         }
     };
 
     // Step 9 — Atomic move to plugin directory (post-gate failures still roll back)
     if let Err(e) = fs::create_dir_all(&plugin_base) {
-        let _ = fs::remove_dir_all(&stage_dir);
+        let _ = fs::remove_dir_all(stage_dir);
         return Err(VynmError::Io(e));
     }
 
-    let bak = plugin_base.join(format!("{}.bak", entry.slug));
+    let bak = plugin_base.join(format!("{slug}.bak"));
     let had_existing = dest.exists();
 
     if had_existing {
@@ -338,7 +377,7 @@ pub async fn install(
             let _ = fs::remove_dir_all(&bak);
         }
         if let Err(e) = fs::rename(&dest, &bak) {
-            let _ = fs::remove_dir_all(&stage_dir);
+            let _ = fs::remove_dir_all(stage_dir);
             return Err(VynmError::Io(e));
         }
     }
@@ -347,41 +386,166 @@ pub async fn install(
         if had_existing {
             let _ = fs::rename(&bak, &dest);
         }
-        let _ = fs::remove_dir_all(&stage_dir);
+        let _ = fs::remove_dir_all(stage_dir);
         return Err(VynmError::Io(e));
     }
 
     if had_existing {
         let _ = fs::remove_dir_all(&bak);
     }
-    let _ = fs::remove_dir_all(&stage_dir);
+    let _ = fs::remove_dir_all(stage_dir);
 
     // R10-02 — record in the explicit state store; a plugin on disk but
     // untracked is exactly the drift this store exists to prevent. §6.2: the
-    // origin source name rides along for future update resolution.
+    // origin source name rides along for future update resolution. V-15:
+    // archive installs record `source: "local"` with the raw path-or-URL.
     record_install(
         tmp_dir,
         InstalledEntry {
-            slug: entry.slug.clone(),
+            slug: slug.to_string(),
             version: manifest.version.clone(),
             sha256: actual_hash,
             installed_at: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
-            source_url: source.url.clone(),
-            source: source.name.clone(),
+            source_url: source_url.to_string(),
+            source: source_name.to_string(),
             tree_sha256,
         },
     )?;
 
     Ok(InstalledPlugin {
-        slug: entry.slug.clone(),
+        slug: slug.to_string(),
         plugin_id: manifest.plugin_id.clone(),
         version: manifest.version.clone(),
         binary_path: dest.join(&manifest.binary),
         sandbox_hint: manifest.sandbox.unwrap_or(true),
     })
+}
+
+/// V-15 — where an archive-mode install gets its bytes: a local file path or
+/// a direct archive URL. No registry resolution, no signature, no cache.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArchiveOrigin {
+    LocalPath(PathBuf),
+    DirectUrl(String),
+}
+
+/// The prominent no-guarantee notice every archive-mode install prints once
+/// the actual sha256 is known. Exposed so tests pin the exact wording.
+pub fn format_local_archive_notice(sha256_hex: &str) -> String {
+    format!(
+        "⚠ local archive: no registry signature / published-sha256 guarantee applies \
+         (computed sha256: {sha256_hex})"
+    )
+}
+
+/// D8 for direct archive URLs (V-15): there is no source config here, so the
+/// `--allow-unsigned` install flag IS the operator consent. https:// passes
+/// unconditionally; plain http:// needs the flag.
+fn ensure_direct_url_allowed(url: &str, allow_http: bool) -> Result<(), VynmError> {
+    if url.starts_with("https://") {
+        return Ok(());
+    }
+    if url.starts_with("http://") && allow_http {
+        tracing::warn!("direct archive URL uses insecure http:// — allowed by --allow-unsigned");
+        return Ok(());
+    }
+    Err(VynmError::Internal(
+        "refusing insecure http:// direct archive download — pass --allow-unsigned to accept \
+         unencrypted transports"
+            .into(),
+    ))
+}
+
+/// Best-effort pre-extraction peek at plugin.json's plugin_id so the archive
+/// pipeline knows its slug before anything is extracted. None = absent or
+/// unreadable; the authoritative refusal then comes from validating the
+/// staged copy, exactly like a malformed manifest.
+fn peek_plugin_id(bytes: &[u8]) -> Option<String> {
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).ok()?;
+    let mut entry = zip.by_name("plugin.json").ok()?;
+    let mut buf = Vec::new();
+    entry.read_to_end(&mut buf).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&buf).ok()?;
+    value.get("plugin_id")?.as_str().map(str::to_string)
+}
+
+/// V-15 — execute the archive-install pipeline for a local zip file or a
+/// direct archive URL: acquire bytes → sha256 → extract → validate on the
+/// staged copy → permission-confirm gate (V-10) → swap → record with
+/// `source: "local"`. Deliberately SKIPS the revocation gate, entry-signature
+/// check and registry cache — there is no registry in this flow; the printed
+/// [`format_local_archive_notice`] states what that costs the operator.
+/// Drop-in writing stays with the caller, same as [`install`].
+pub async fn install_archive(
+    origin: &ArchiveOrigin,
+    tmp_dir: &Path,
+    max_archive_bytes: u64,
+    max_extracted_bytes: u64,
+    max_archive_entries: usize,
+    allow_http: bool,
+    confirm: impl FnOnce(&InstallManifest) -> Result<(), VynmError>,
+) -> Result<InstalledPlugin, VynmError> {
+    // Step 1 — acquire bytes. Direct URL downloads only AFTER the D8 gate:
+    // no byte may move before consent, mirroring the registry pipeline.
+    let (bytes, source_url) = match origin {
+        ArchiveOrigin::LocalPath(path) => {
+            let meta = fs::metadata(path).map_err(VynmError::Io)?;
+            if meta.len() > max_archive_bytes {
+                return Err(VynmError::Internal(format!(
+                    "archive size {} exceeds max {max_archive_bytes} bytes",
+                    meta.len()
+                )));
+            }
+            (fs::read(path)?, path.display().to_string())
+        }
+        ArchiveOrigin::DirectUrl(url) => {
+            ensure_direct_url_allowed(url, allow_http)?;
+            (
+                download_with_progress(url, "archive", max_archive_bytes).await?,
+                url.clone(),
+            )
+        }
+    };
+
+    // Step 2 — NO channel guarantee here: compute the real digest and say so,
+    // prominently, before any validation decision.
+    let actual_hash = hex_encode(&Sha256::digest(&bytes));
+    eprintln!("{}", format_local_archive_notice(&actual_hash));
+
+    // Staging key: the manifest's plugin_id, peeks out of the archive without
+    // extracting. Unparsable manifests still stage (under a neutral name) so
+    // validate_manifest produces the canonical refusal and cleanup erases it.
+    let slug = peek_plugin_id(&bytes).unwrap_or_else(|| "archive".to_string());
+
+    let plugin_base = plugin_dir(tmp_dir);
+    let stage_dir = tmp_install_dir(&plugin_base, &slug);
+    let _ = fs::remove_dir_all(&stage_dir);
+    fs::create_dir_all(&stage_dir).map_err(VynmError::Io)?;
+
+    let archive_path = stage_dir.join(format!("{slug}.zip"));
+    if let Err(e) = fs::write(&archive_path, &bytes) {
+        let _ = fs::remove_dir_all(&stage_dir);
+        return Err(VynmError::Io(e));
+    }
+
+    // Steps 3+ — identical boundaries to the registry pipeline (V-10 gate,
+    // bak/rename swap, ledger record, tree digest); no revocation/signature/
+    // cache steps exist here by design.
+    commit_staged(
+        tmp_dir,
+        &stage_dir,
+        &slug,
+        None, // D2: kernel compat re-validated authoritatively at boot
+        actual_hash,
+        "local",
+        &source_url,
+        max_extracted_bytes,
+        max_archive_entries,
+        confirm,
+    )
 }
 
 /// R10-02 — skip the whole install pipeline when the state store says `slug`

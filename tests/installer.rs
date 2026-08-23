@@ -12,7 +12,10 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
 use tempfile::{tempdir, TempDir};
 use vynkor_manager::dropin::{disable_plugin_config, enable_plugin_config, plugin_dir, Toggle};
-use vynkor_manager::installer::{extract_zip, format_permission_preview, install, skip_reinstall};
+use vynkor_manager::installer::{
+    extract_zip, format_local_archive_notice, format_permission_preview, install, install_archive,
+    skip_reinstall, ArchiveOrigin,
+};
 use vynkor_manager::registry::{signed_message, RegistryEntry};
 use vynkor_manager::source::RegistrySource;
 use vynkor_manager::state::{load_state, record_install};
@@ -860,4 +863,211 @@ async fn unsigned_consent_then_gate_yes_still_installs() {
 
     assert_eq!(installed.slug, "two-ask");
     assert!(load_state(tmp).get("two-ask").is_some(), "ledger recorded");
+}
+
+// ── V-15 archive installs (local zip / direct URL) ──────────────────────────
+
+#[test]
+fn local_archive_notice_names_the_missing_guarantees_and_digest() {
+    let n = format_local_archive_notice("abc123");
+    assert!(n.contains("no registry signature"), "unexpected: {n}");
+    assert!(
+        n.contains("published-sha256 guarantee applies"),
+        "unexpected: {n}"
+    );
+    assert!(n.contains("computed sha256: abc123"), "unexpected: {n}");
+}
+
+// happy path: --yes variant — gate fires with the real staged manifest,
+// ledger records source "local" + the path, drop-in written by the caller
+#[tokio::test]
+async fn archive_local_zip_happy_path() {
+    let sandbox = Sandbox::new();
+    let tmp = sandbox.dir.path();
+    let (archive, hash) = build_archive("local-dev", "");
+    let zip_path = tmp.join("local-dev.zip");
+    fs::write(&zip_path, &archive).unwrap();
+
+    let installed = install_archive(
+        &ArchiveOrigin::LocalPath(zip_path.clone()),
+        tmp,
+        MAX_ARCHIVE,
+        MAX_EXTRACTED,
+        MAX_ENTRIES,
+        false, // allow_http irrelevant for local files
+        |manifest| {
+            // V-10 gate fired with the parsed manifest of the staged copy
+            assert_eq!(manifest.plugin_id, "local-dev");
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(installed.slug, "local-dev");
+    assert_eq!(installed.version, "1.0.0");
+    assert!(installed.binary_path.exists());
+
+    let rec = load_state(tmp)
+        .get("local-dev")
+        .expect("ledger recorded")
+        .clone();
+    assert_eq!(rec.source, "local");
+    assert_eq!(rec.source_url, zip_path.display().to_string());
+    assert_eq!(rec.sha256, hash);
+    assert!(rec.tree_sha256.is_some(), "V-13 digest still recorded");
+
+    // drop-in written by the caller, exactly like registry installs
+    let params = vynkor_manager::dropin::DropinParams {
+        slug: &installed.slug,
+        plugin_id: &installed.plugin_id,
+        binary_path: &installed.binary_path,
+        sandbox: true,
+    };
+    assert!(vynkor_manager::dropin::write_plugin_config(&tmp.join("plugins.d"), &params).unwrap());
+    assert!(tmp.join("plugins.d").join("local-dev.yaml").exists());
+}
+
+// malformed manifest inside a LOCAL archive → refused, zero trace
+#[tokio::test]
+async fn archive_malformed_manifest_refused_with_zero_trace() {
+    let sandbox = Sandbox::new();
+    let tmp = sandbox.dir.path();
+
+    let mut buf = std::io::Cursor::new(Vec::new());
+    {
+        let mut zip = zip::ZipWriter::new(&mut buf);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        zip.start_file("plugin.json", opts).unwrap();
+        zip.write_all(br#"{"plugin_id":"broken","version":"","permissions":[]}"#)
+            .unwrap();
+        zip.finish().unwrap();
+    }
+    let zip_path = tmp.join("broken.zip");
+    fs::write(&zip_path, buf.into_inner()).unwrap();
+
+    let err = install_archive(
+        &ArchiveOrigin::LocalPath(zip_path),
+        tmp,
+        MAX_ARCHIVE,
+        MAX_EXTRACTED,
+        MAX_ENTRIES,
+        false,
+        |_| panic!("gate must not fire on an invalid manifest"),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(!err.to_string().is_empty());
+    let base = plugin_dir(tmp);
+    assert!(!base.join("broken").exists(), "dest untouched");
+    assert!(
+        !base.join(".install-tmp-broken").exists(),
+        "staging cleaned"
+    );
+    assert!(
+        load_state(tmp).get("broken").is_none(),
+        "ledger not recorded"
+    );
+}
+
+// zip-slip inside a LOCAL archive → refused verbatim; the boundary holds
+// regardless of where the bytes came from
+#[tokio::test]
+async fn archive_zip_slip_in_local_file_refused_verbatim() {
+    let sandbox = Sandbox::new();
+    let tmp = sandbox.dir.path();
+    make_zip_raw(
+        &tmp.join("evil-local.zip"),
+        &[
+            (
+                "plugin.json",
+                br#"{"plugin_id":"evil","version":"1.0.0","permissions":[],"binary":"evil","kernel_compatibility_range":{"min":"0.1.0","max":"*"}}"#
+                    as &[u8],
+                None,
+            ),
+            ("../escaped.txt", b"x", None),
+        ],
+    );
+
+    let err = install_archive(
+        &ArchiveOrigin::LocalPath(tmp.join("evil-local.zip")),
+        tmp,
+        MAX_ARCHIVE,
+        MAX_EXTRACTED,
+        MAX_ENTRIES,
+        false,
+        |_| Ok(()),
+    )
+    .await
+    .unwrap_err();
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("path traversal detected in entry '../escaped.txt'"),
+        "refusal must be verbatim: {msg}"
+    );
+    assert!(
+        !tmp.parent().unwrap().join("escaped.txt").exists()
+            && !plugin_dir(tmp).join("escaped.txt").exists(),
+        "must not escape anywhere"
+    );
+}
+
+// D8 for direct URLs: http:// refused naming --allow-unsigned BEFORE any
+// request moves; with the flag it downloads and installs
+#[tokio::test]
+async fn direct_http_url_refused_without_allow_unsigned_then_installs_with_it() {
+    let sandbox = Sandbox::new();
+    let tmp = sandbox.dir.path();
+    let mut server = mockito::Server::new_async().await;
+    let (archive, hash) = build_archive("fetched", "");
+    let url = format!("{}/fetched.zip", server.url());
+    // first phase must never hit the wire; second phase hits exactly once
+    let mock = server
+        .mock("GET", "/fetched.zip")
+        .with_status(200)
+        .with_body(archive)
+        .expect(1)
+        .create_async()
+        .await;
+
+    let err = install_archive(
+        &ArchiveOrigin::DirectUrl(url.clone()),
+        tmp,
+        MAX_ARCHIVE,
+        MAX_EXTRACTED,
+        MAX_ENTRIES,
+        false, // no consent
+        |_| Ok(()),
+    )
+    .await
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("http://") && msg.contains("--allow-unsigned"),
+        "refusal must name the exact knob: {msg}"
+    );
+
+    let installed = install_archive(
+        &ArchiveOrigin::DirectUrl(url),
+        tmp,
+        MAX_ARCHIVE,
+        MAX_EXTRACTED,
+        MAX_ENTRIES,
+        true, // the flag IS the consent — there is no source config here
+        |_| Ok(()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(installed.slug, "fetched");
+
+    let rec = load_state(tmp)
+        .get("fetched")
+        .expect("ledger recorded")
+        .clone();
+    assert_eq!(rec.source, "local");
+    assert_eq!(rec.sha256, hash);
+    mock.assert_async().await;
 }

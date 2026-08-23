@@ -34,7 +34,9 @@ pub struct InstalledEntry {
     pub source_url: String,
     /// §6.2 origin source name (`official`, or a configured source name).
     /// updates/reinstalls resolve against it once multiple sources exist;
-    /// pre-v2 ledgers read back as `official`.
+    /// pre-v2 ledgers read back as `official`. V-15: `local` marks an
+    /// archive-mode install — V-12 `update` must treat it as not-updatable
+    /// via registries.
     #[serde(default = "default_source")]
     pub source: String,
     /// V-13 digest of the INSTALLED TREE at install time (`installer::
