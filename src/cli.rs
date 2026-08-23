@@ -175,10 +175,88 @@ pub enum Command {
     Enable { slug: String },
     /// Stop auto-spawning an installed plugin (drop-in renamed .disabled)
     Disable { slug: String },
+    /// Generate an ed25519 signing key pair for registry publishing (V-14)
+    Keygen {
+        /// Name for the default output path (<name>.key)
+        name: Option<String>,
+        /// Output path for the hex seed (default ./<name>.key)
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Overwrite the key file if it already exists
+        #[arg(long)]
+        force: bool,
+    },
+    /// Sign (or with --verify, check) a registry entry over the canonical
+    /// seven-field message (V-14)
+    Sign {
+        /// Path to the hex-seed key file (from `vynm keygen`)
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long)]
+        slug: String,
+        #[arg(long)]
+        version: String,
+        #[arg(long)]
+        sha256: String,
+        /// Lifecycle status baked into the signature
+        #[arg(long, default_value = "stable")]
+        status: String,
+        #[arg(long)]
+        archive_url: String,
+        /// Minimum kernel version
+        #[arg(long)]
+        min: String,
+        /// Maximum kernel version
+        #[arg(long, default_value = "*")]
+        max: String,
+        /// Verify an existing signature instead of signing
+        #[arg(long, requires = "public_key", requires = "signature")]
+        verify: bool,
+        /// Public key hex (verify mode)
+        #[arg(long)]
+        public_key: Option<String>,
+        /// Signature hex to check (verify mode)
+        #[arg(long)]
+        signature: Option<String>,
+    },
 }
 
 /// Dispatch a parsed invocation; errors bubble to main for exit-code mapping.
 pub async fn run(cli: &Cli) -> Result<(), VynmError> {
+    // keygen/sign are local crypto ops — no config file, no network
+    match &cli.command {
+        Command::Keygen { name, out, force } => {
+            return keygen_cmd(name.as_deref(), out.as_deref(), *force)
+        }
+        Command::Sign {
+            key,
+            slug,
+            version,
+            sha256,
+            status,
+            archive_url,
+            min,
+            max,
+            verify,
+            public_key,
+            signature,
+        } => {
+            return sign_cmd(
+                key,
+                slug,
+                version,
+                sha256,
+                status,
+                archive_url,
+                min,
+                max,
+                *verify,
+                public_key.as_deref(),
+                signature.as_deref(),
+            )
+        }
+        _ => {}
+    }
     let ctx = Ctx::load(&cli.config)?;
     match &cli.command {
         Command::Install { slug, source } => {
@@ -193,6 +271,8 @@ pub async fn run(cli: &Cli) -> Result<(), VynmError> {
         Command::Remove { slug } => remove_cmd(&ctx, slug),
         Command::Enable { slug } => enable_cmd(&ctx, slug),
         Command::Disable { slug } => disable_cmd(&ctx, slug),
+        // both handled above, before Ctx::load
+        Command::Keygen { .. } | Command::Sign { .. } => Ok(()),
     }
 }
 
@@ -307,4 +387,52 @@ fn report_toggle(slug: &str, outcome: Toggle) {
         Toggle::Already => println!("'{slug}' was already in the requested state"),
         Toggle::Missing => println!("no drop-in found for '{slug}'"),
     }
+}
+
+// ── V-14: maintainer crypto ────────────────────────────────────────────────
+
+fn keygen_cmd(name: Option<&str>, out: Option<&Path>, force: bool) -> Result<(), VynmError> {
+    let name = name.unwrap_or("vynm");
+    crate::validate::validate_identifier(name, 64)?;
+    let path = out
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from(format!("./{name}.key")));
+    let key = crate::keygen::generate_signing_key()?;
+    crate::keygen::write_seed_file(&path, key.as_bytes(), force)?;
+    eprintln!(
+        "secret seed written to {} — keep it private, NEVER commit it",
+        path.display()
+    );
+    // bare hex on stdout so the operator can paste it straight into
+    // `marketplace_public_key:`
+    println!("{}", crate::keygen::public_key_hex(&key));
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sign_cmd(
+    key_path: &Path,
+    slug: &str,
+    version: &str,
+    sha256: &str,
+    status: &str,
+    archive_url: &str,
+    min: &str,
+    max: &str,
+    verify: bool,
+    public_key: Option<&str>,
+    signature: Option<&str>,
+) -> Result<(), VynmError> {
+    let entry =
+        crate::sign::entry_from_fields(slug, version, sha256, status, archive_url, min, max);
+    if verify {
+        let sig = signature.expect("clap enforces --signature with --verify");
+        let pk = public_key.expect("clap enforces --public-key with --verify");
+        crate::sign::verify_signature(&entry, sig, pk)?;
+        println!("✓ signature valid for {slug}@{version}");
+        return Ok(());
+    }
+    let key = crate::sign::load_signing_key(key_path)?;
+    println!("{}", crate::sign::sign_entry(&key, &entry));
+    Ok(())
 }

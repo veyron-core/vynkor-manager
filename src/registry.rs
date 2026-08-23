@@ -109,7 +109,7 @@ pub struct RegistryCache {
     pub plugins: BTreeMap<String, CachedPluginInfo>,
 }
 
-fn hex_decode(s: &str) -> Result<Vec<u8>, VynmError> {
+pub(crate) fn hex_decode(s: &str) -> Result<Vec<u8>, VynmError> {
     // % not is_multiple_of: stable only since 1.87, our MSRV is 1.85
     if s.len() % 2 != 0 {
         return Err(VynmError::Internal("invalid hex: odd length".into()));
@@ -121,6 +121,11 @@ fn hex_decode(s: &str) -> Result<Vec<u8>, VynmError> {
                 .map_err(|e| VynmError::Internal(format!("invalid hex: {e}")))
         })
         .collect()
+}
+
+/// lowercase hex — the canonical form for keys/signatures on disk and stdout
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// The message a maintainer signature is computed over. Binding `slug` and
