@@ -48,9 +48,35 @@ pub fn exit_code(err: &VynmError) -> i32 {
 
 // ── config: the kernel's own yaml, minimally read ───────────────────────────
 
-/// Only the keys vynm consumes today (V-06 single-source era); full multi-
-/// source parsing arrives with V-09. Unknown keys are ignored on purpose —
-/// vynm must tolerate every future kernel config addition.
+/// cache_ttl_secs default for a `registries:` entry that omits it — same
+/// value as the built-in official source.
+const DEFAULT_CACHE_TTL_SECS: u64 = 3600;
+
+fn default_true() -> bool {
+    true
+}
+
+/// One `registries:` list entry (V-09). `public_key` absent = unsigned
+/// source (§7.3 consent still required before content is accepted).
+#[derive(Debug, Deserialize)]
+struct RawRegistry {
+    name: String,
+    url: String,
+    #[serde(default)]
+    public_key: Option<String>,
+    #[serde(default)]
+    allow_unsigned: bool,
+    #[serde(default)]
+    cache_ttl_secs: Option<u64>,
+    #[serde(default = "default_true")]
+    enabled: bool,
+}
+
+/// Only the keys vynm consumes. Unknown keys are ignored on purpose — vynm
+/// must tolerate every future kernel config addition. V-09: `registries:`
+/// list plus the legacy single keys kept for back-compat; when both appear
+/// the list wins wholesale (legacy keys only map onto an `official` source
+/// when no list is present).
 #[derive(Debug, Default, Deserialize)]
 struct RawConfig {
     #[serde(default)]
@@ -61,6 +87,83 @@ struct RawConfig {
     marketplace_public_key: Option<String>,
     #[serde(default)]
     registry_cache_ttl_secs: Option<u64>,
+    #[serde(default)]
+    allow_unsigned: Option<bool>,
+    #[serde(default)]
+    registries: Vec<RawRegistry>,
+}
+
+/// Map parsed config onto the configured source list:
+/// `registries:` list > back-compat single keys > built-in official default.
+/// Duplicate names are a hard error naming both entries.
+fn build_sources(raw: &RawConfig) -> Result<Vec<RegistrySource>, String> {
+    if raw.registries.is_empty() {
+        let mut s = official_source();
+        // back-compat single keys override the official entry's fields
+        if let Some(url) = &raw.registry_url {
+            s.url = url.clone();
+        }
+        if let Some(key) = &raw.marketplace_public_key {
+            s.public_key = Some(key.clone());
+        }
+        if let Some(ttl) = raw.registry_cache_ttl_secs {
+            s.cache_ttl_secs = ttl;
+        }
+        if let Some(a) = raw.allow_unsigned {
+            s.allow_unsigned = a;
+        }
+        return Ok(vec![s]);
+    }
+    let mut out: Vec<RegistrySource> = Vec::with_capacity(raw.registries.len());
+    for (i, r) in raw.registries.iter().enumerate() {
+        if r.name.trim().is_empty() {
+            return Err(format!("registries[{}]: name must be non-empty", i + 1));
+        }
+        if r.url.trim().is_empty() {
+            return Err(format!(
+                "registries[{}] ({}): url must be non-empty",
+                i + 1,
+                r.name
+            ));
+        }
+        if let Some(prev) = out.iter().position(|s| s.name == r.name) {
+            return Err(format!(
+                "duplicate registry name '{}' (entries {} and {})",
+                r.name,
+                prev + 1,
+                i + 1
+            ));
+        }
+        out.push(RegistrySource {
+            name: r.name.clone(),
+            url: r.url.clone(),
+            public_key: r.public_key.clone(),
+            allow_unsigned: r.allow_unsigned,
+            cache_ttl_secs: r.cache_ttl_secs.unwrap_or(DEFAULT_CACHE_TTL_SECS),
+            enabled: r.enabled,
+        });
+    }
+    Ok(out)
+}
+
+/// Precedence tier between CLI flags and config: env vars override the
+/// effective (first) source's fields in place — the name is kept so per-source
+/// caches and ledger origins stay stable. Empty values are ignored so a
+/// stray `VYNM_REGISTRY_URL=""` cannot blank a good URL.
+fn apply_env_overrides(sources: &mut [RegistrySource]) {
+    let Some(first) = sources.first_mut() else {
+        return;
+    };
+    if let Ok(url) = std::env::var("VYNM_REGISTRY_URL") {
+        if !url.trim().is_empty() {
+            first.url = url;
+        }
+    }
+    if let Ok(key) = std::env::var("VYNM_MARKETPLACE_PUBLIC_KEY") {
+        if !key.trim().is_empty() {
+            first.public_key = Some(key);
+        }
+    }
 }
 
 /// Resolve the drop-in plugin dir — ported verbatim from the kernel's
@@ -76,9 +179,13 @@ pub fn resolve_plugins_dir(config_path: &str, explicit: Option<&Path>) -> PathBu
 }
 
 /// Everything a command needs, resolved from `--config`.
+#[derive(Debug)]
 pub struct Ctx {
     pub plugins_dir: PathBuf,
-    pub source: RegistrySource,
+    /// configured sources in listed order; `[0]` is the effective default.
+    /// V-09: resolution (--source, bare-slug search, explicit `name/slug`)
+    /// works over this list.
+    pub sources: Vec<RegistrySource>,
     /// Fallback base for state/plugin dirs when `$HOME`/XDG are unset —
     /// private per-process scratch, never the shared world-writable /tmp root.
     pub tmp_dir: PathBuf,
@@ -95,34 +202,38 @@ impl Ctx {
                 .map_err(|e| VynmError::InvalidInput(format!("{}: {e}", config_path)))?,
             Err(_) => RawConfig::default(), // no config yet → pure defaults
         };
-        let mut source = official_source();
-        if let Some(url) = raw.registry_url {
-            // back-compat single-key override maps onto the official entry
-            source.url = url;
-        }
-        if let Some(key) = raw.marketplace_public_key {
-            source.public_key = Some(key);
-        }
-        if let Some(ttl) = raw.registry_cache_ttl_secs {
-            source.cache_ttl_secs = ttl;
-        }
+        let mut sources = build_sources(&raw)
+            .map_err(|e| VynmError::InvalidInput(format!("{config_path}: {e}")))?;
+        apply_env_overrides(&mut sources);
         Ok(Self {
             plugins_dir: resolve_plugins_dir(config_path, raw.plugins_dir.as_deref()),
-            source,
+            sources,
             tmp_dir: scratch_base(),
         })
     }
 
-    /// §6.5: `--source <name>` validates against the configured list — one
-    /// name today; adding N sources changes this lookup only, not the CLI.
+    /// configured source names, in listed order — error listings use this
+    pub fn source_names(&self) -> Vec<&str> {
+        self.sources.iter().map(|s| s.name.as_str()).collect()
+    }
+
+    /// §6.5: `--source <name>` exact-matches against the configured list;
+    /// None → the effective default (`sources[0]`). Unknown → error listing
+    /// all configured names.
     pub fn resolve_source(&self, requested: Option<&str>) -> Result<RegistrySource, VynmError> {
         match requested {
-            None => Ok(self.source.clone()),
-            Some(name) if name == self.source.name => Ok(self.source.clone()),
-            Some(other) => Err(VynmError::InvalidInput(format!(
-                "unknown source '{other}' — configured sources: {}",
-                self.source.name
-            ))),
+            None => Ok(self.sources[0].clone()),
+            Some(name) => self
+                .sources
+                .iter()
+                .find(|s| s.name == name)
+                .cloned()
+                .ok_or_else(|| {
+                    VynmError::InvalidInput(format!(
+                        "unknown source '{name}' — configured sources: {}",
+                        self.source_names().join(", ")
+                    ))
+                }),
         }
     }
 }

@@ -3,13 +3,23 @@
 
 use std::fs;
 use std::path::Path;
+use std::sync::{Mutex, MutexGuard};
 
 use tempfile::tempdir;
 use vynkor_manager::cli::{
     exit_code, resolve_plugins_dir, Ctx, EXIT_FAILURE, EXIT_NETWORK, EXIT_OK, EXIT_VERIFICATION,
 };
-use vynkor_manager::source::official_source;
+use vynkor_manager::source::{official_source, RegistrySource};
 use vynkor_manager::VynmError;
+
+// env is process-global: every Ctx::load test takes this so the VYNM_* env
+// precedence tests can't leak into parallel assertions (same pattern as
+// tests/installer.rs)
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+fn env_guard() -> MutexGuard<'static, ()> {
+    ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+}
 
 // ── exit codes (scripting contract) ─────────────────────────────────────────
 
@@ -57,7 +67,7 @@ fn everything_else_maps_to_exit_1() {
 fn source_validation_accepts_configured_and_rejects_unknown() {
     let ctx = Ctx {
         plugins_dir: Path::new("/tmp").into(),
-        source: official_source(),
+        sources: vec![official_source()],
         tmp_dir: Path::new("/tmp").into(),
     };
 
@@ -105,6 +115,7 @@ fn explicit_plugins_dir_key_wins_over_derivation() {
 // Ctx::load exactly like the kernel's own load_config would
 #[test]
 fn config_round_trip_with_kernel_style_yaml() {
+    let _env = env_guard();
     let tmp = tempdir().unwrap();
     fs::write(
         tmp.path().join("config.yaml"),
@@ -117,10 +128,10 @@ fn config_round_trip_with_kernel_style_yaml() {
     assert_eq!(ctx.plugins_dir, Path::new("/custom/dropins"));
     // single-key back-compat maps onto the official entry
     assert_eq!(
-        ctx.source.url,
+        ctx.sources[0].url,
         "https://registries.corp.internal/registry.json"
     );
-    assert_eq!(ctx.source.name, "official");
+    assert_eq!(ctx.sources[0].name, "official");
 }
 
 #[test]
@@ -130,5 +141,232 @@ fn missing_config_file_yields_pure_defaults() {
         ctx.plugins_dir,
         resolve_plugins_dir("/nonexistent/vynm/config.yaml", None)
     );
-    assert_eq!(ctx.source.name, "official");
+    assert_eq!(ctx.sources[0].name, "official");
+}
+
+// ── V-09: registries list schema + precedence matrix ───────────────────────
+
+// full-schema list entry: every optional key honored, order preserved
+#[test]
+fn registries_list_parses_full_schema() {
+    let _env = env_guard();
+    let tmp = tempdir().unwrap();
+    fs::write(
+        tmp.path().join("config.yaml"),
+        r#"
+port: 8080  # kernel-only key, must stay tolerated
+registries:
+  - name: corp
+    url: https://registries.corp.internal/registry.json
+    public_key: aabb
+    allow_unsigned: true
+    cache_ttl_secs: 60
+  - name: staging
+    url: https://staging.example/registry.json
+    enabled: false
+"#,
+    )
+    .unwrap();
+
+    let ctx = Ctx::load(tmp.path().join("config.yaml").to_str().unwrap()).unwrap();
+    let corp = &ctx.sources[0];
+    assert_eq!(corp.name, "corp");
+    assert_eq!(corp.url, "https://registries.corp.internal/registry.json");
+    assert_eq!(corp.public_key.as_deref(), Some("aabb"));
+    assert!(corp.allow_unsigned);
+    assert_eq!(corp.cache_ttl_secs, 60);
+    assert!(corp.enabled);
+
+    let staging = &ctx.sources[1];
+    assert_eq!(staging.name, "staging");
+    // absent public_key = unsigned source
+    assert_eq!(staging.public_key, None);
+    // defaults: no consent, builtin ttl, disabled as written
+    assert!(!staging.allow_unsigned);
+    assert_eq!(staging.cache_ttl_secs, 3600);
+    assert!(!staging.enabled);
+
+    assert_eq!(ctx.source_names(), vec!["corp", "staging"]);
+}
+
+// duplicate names are a parse error naming both entries
+#[test]
+fn duplicate_registry_names_error_names_both_entries() {
+    let tmp = tempdir().unwrap();
+    fs::write(
+        tmp.path().join("config.yaml"),
+        r#"
+registries:
+  - name: corp
+    url: https://a.example/r.json
+  - name: official
+    url: https://b.example/r.json
+  - name: corp
+    url: https://c.example/r.json
+"#,
+    )
+    .unwrap();
+
+    let err = Ctx::load(tmp.path().join("config.yaml").to_str().unwrap()).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("duplicate registry name 'corp'"),
+        "unexpected: {msg}"
+    );
+    assert!(msg.contains("entries 1 and 3"), "unexpected: {msg}");
+}
+
+// precedence tier 3 > 4: when registries: is present, legacy single keys are
+// ignored wholesale (they only map onto `official` without a list)
+#[test]
+fn registries_list_beats_legacy_single_keys() {
+    let _env = env_guard();
+    let tmp = tempdir().unwrap();
+    fs::write(
+        tmp.path().join("config.yaml"),
+        r#"
+registry_url: https://legacy.example/r.json
+marketplace_public_key: deadbeef
+allow_unsigned: true
+registries:
+  - name: corp
+    url: https://corp.example/r.json
+"#,
+    )
+    .unwrap();
+
+    let ctx = Ctx::load(tmp.path().join("config.yaml").to_str().unwrap()).unwrap();
+    assert_eq!(ctx.sources.len(), 1);
+    assert_eq!(ctx.sources[0].name, "corp");
+    assert_eq!(ctx.sources[0].url, "https://corp.example/r.json");
+    // legacy key did NOT leak into the listed entry
+    assert_eq!(ctx.sources[0].public_key, None);
+    assert!(!ctx.sources[0].allow_unsigned);
+}
+
+// precedence tier 2: env overrides the configured default source in place,
+// keeping its name (per-source cache + ledger identity stay stable)
+#[test]
+fn env_url_beats_registries_list() {
+    let _env = env_guard();
+    temp_env::with_var(
+        "VYNM_REGISTRY_URL",
+        Some("https://env.example/r.json"),
+        || {
+            let tmp = tempdir().unwrap();
+            fs::write(
+                tmp.path().join("config.yaml"),
+                "registries:\n  - name: corp\n    url: https://corp.example/r.json\n",
+            )
+            .unwrap();
+            let ctx = Ctx::load(tmp.path().join("config.yaml").to_str().unwrap()).unwrap();
+            assert_eq!(ctx.sources[0].url, "https://env.example/r.json");
+            assert_eq!(ctx.sources[0].name, "corp");
+            assert_eq!(ctx.sources.len(), 1);
+        },
+    );
+}
+
+#[test]
+fn env_key_beats_configured_key() {
+    let _env = env_guard();
+    temp_env::with_var("VYNM_MARKETPLACE_PUBLIC_KEY", Some("envkey"), || {
+        let tmp = tempdir().unwrap();
+        fs::write(
+                tmp.path().join("config.yaml"),
+                "registries:\n  - name: corp\n    url: https://corp.example/r.json\n    public_key: cfgkey\n",
+            )
+            .unwrap();
+        let ctx = Ctx::load(tmp.path().join("config.yaml").to_str().unwrap()).unwrap();
+        assert_eq!(ctx.sources[0].public_key.as_deref(), Some("envkey"));
+    });
+}
+
+#[test]
+fn env_vars_ignored_when_unset_or_empty() {
+    let _env = env_guard();
+    let tmp = tempdir().unwrap();
+    fs::write(
+        tmp.path().join("config.yaml"),
+        "registries:\n  - name: corp\n    url: https://corp.example/r.json\n",
+    )
+    .unwrap();
+    let path = tmp.path().join("config.yaml").to_str().unwrap().to_string();
+    temp_env::with_var("VYNM_REGISTRY_URL", Some(""), || {
+        let ctx = Ctx::load(&path).unwrap();
+        // empty env value must not blank the configured URL
+        assert_eq!(ctx.sources[0].url, "https://corp.example/r.json");
+    });
+    temp_env::with_var_unset("VYNM_REGISTRY_URL", || {
+        temp_env::with_var_unset("VYNM_MARKETPLACE_PUBLIC_KEY", || {
+            let ctx = Ctx::load(&path).unwrap();
+            assert_eq!(ctx.sources[0].url, "https://corp.example/r.json");
+        });
+    });
+}
+
+// precedence tier 4 > 5: legacy single keys map onto an official-named source
+#[test]
+fn legacy_single_keys_map_onto_official() {
+    let _env = env_guard();
+    let tmp = tempdir().unwrap();
+    fs::write(
+        tmp.path().join("config.yaml"),
+        r#"
+registry_url: http://legacy.local/r.json
+registry_cache_ttl_secs: 30
+allow_unsigned: true
+"#,
+    )
+    .unwrap();
+
+    let ctx = Ctx::load(tmp.path().join("config.yaml").to_str().unwrap()).unwrap();
+    let s = &ctx.sources[0];
+    assert_eq!(s.name, "official");
+    assert_eq!(s.url, "http://legacy.local/r.json");
+    assert_eq!(s.cache_ttl_secs, 30);
+    assert!(s.allow_unsigned);
+    // built-in pinned key survives — legacy configs keep signature checking
+    assert!(s.public_key.is_some());
+}
+
+// precedence tier 5: neither list nor single keys → built-in official
+#[test]
+fn empty_config_yields_builtin_official() {
+    let _env = env_guard();
+    let tmp = tempdir().unwrap();
+    fs::write(tmp.path().join("config.yaml"), "port: 8080\n").unwrap();
+    let ctx = Ctx::load(tmp.path().join("config.yaml").to_str().unwrap()).unwrap();
+    assert_eq!(ctx.sources.len(), 1);
+    assert_eq!(ctx.sources[0], official_source());
+}
+
+// --source matches ANY configured name; unknown lists every name
+#[test]
+fn resolve_source_matches_any_configured_name() {
+    let ctx = Ctx {
+        plugins_dir: Path::new("/tmp").into(),
+        sources: vec![
+            RegistrySource {
+                name: "official".into(),
+                ..official_source()
+            },
+            RegistrySource {
+                name: "corp".into(),
+                ..official_source()
+            },
+        ],
+        tmp_dir: Path::new("/tmp").into(),
+    };
+
+    assert_eq!(ctx.resolve_source(Some("corp")).unwrap().name, "corp");
+    assert_eq!(ctx.resolve_source(None).unwrap().name, "official");
+
+    let err = ctx.resolve_source(Some("nope")).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("unknown source 'nope'"), "unexpected: {msg}");
+    assert!(
+        msg.contains("configured sources: official, corp"),
+        "unexpected: {msg}"
+    );
 }
