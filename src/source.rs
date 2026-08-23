@@ -29,7 +29,7 @@ pub fn official_source() -> RegistrySource {
 /// §6.1 — a named registry origin. `public_key: None` means "no signature
 /// verification"; such a source must be explicitly opted in via
 /// `allow_unsigned` when non-interactive (§7.3 gating).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegistrySource {
     /// Ledger/cache identity (`installed.json#source`, cache file name).
     pub name: String,

@@ -3,17 +3,19 @@
 //! user-facing contract: subcommands take `--source <name>` from day one
 //! (§6.5 — adding sources later changes resolution logic, never grammar).
 
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use serde::Deserialize;
+use vynkor_wire::manifest::InstallManifest;
 
 use crate::dropin::{
     disable_plugin_config, enable_plugin_config, plugin_dir, remove_plugin_config, uninstall,
     write_plugin_config, DropinParams, Toggle,
 };
 use crate::error::VynmError;
-use crate::installer::install;
+use crate::installer::{format_permission_preview, install};
 use crate::registry::{fetch_registry, RegistryEntry};
 use crate::source::{official_source, RegistrySource};
 use crate::state::{format_ts, load_state};
@@ -48,9 +50,35 @@ pub fn exit_code(err: &VynmError) -> i32 {
 
 // ── config: the kernel's own yaml, minimally read ───────────────────────────
 
-/// Only the keys vynm consumes today (V-06 single-source era); full multi-
-/// source parsing arrives with V-09. Unknown keys are ignored on purpose —
-/// vynm must tolerate every future kernel config addition.
+/// cache_ttl_secs default for a `registries:` entry that omits it — same
+/// value as the built-in official source.
+const DEFAULT_CACHE_TTL_SECS: u64 = 3600;
+
+fn default_true() -> bool {
+    true
+}
+
+/// One `registries:` list entry (V-09). `public_key` absent = unsigned
+/// source (§7.3 consent still required before content is accepted).
+#[derive(Debug, Deserialize)]
+struct RawRegistry {
+    name: String,
+    url: String,
+    #[serde(default)]
+    public_key: Option<String>,
+    #[serde(default)]
+    allow_unsigned: bool,
+    #[serde(default)]
+    cache_ttl_secs: Option<u64>,
+    #[serde(default = "default_true")]
+    enabled: bool,
+}
+
+/// Only the keys vynm consumes. Unknown keys are ignored on purpose — vynm
+/// must tolerate every future kernel config addition. V-09: `registries:`
+/// list plus the legacy single keys kept for back-compat; when both appear
+/// the list wins wholesale (legacy keys only map onto an `official` source
+/// when no list is present).
 #[derive(Debug, Default, Deserialize)]
 struct RawConfig {
     #[serde(default)]
@@ -61,6 +89,83 @@ struct RawConfig {
     marketplace_public_key: Option<String>,
     #[serde(default)]
     registry_cache_ttl_secs: Option<u64>,
+    #[serde(default)]
+    allow_unsigned: Option<bool>,
+    #[serde(default)]
+    registries: Vec<RawRegistry>,
+}
+
+/// Map parsed config onto the configured source list:
+/// `registries:` list > back-compat single keys > built-in official default.
+/// Duplicate names are a hard error naming both entries.
+fn build_sources(raw: &RawConfig) -> Result<Vec<RegistrySource>, String> {
+    if raw.registries.is_empty() {
+        let mut s = official_source();
+        // back-compat single keys override the official entry's fields
+        if let Some(url) = &raw.registry_url {
+            s.url = url.clone();
+        }
+        if let Some(key) = &raw.marketplace_public_key {
+            s.public_key = Some(key.clone());
+        }
+        if let Some(ttl) = raw.registry_cache_ttl_secs {
+            s.cache_ttl_secs = ttl;
+        }
+        if let Some(a) = raw.allow_unsigned {
+            s.allow_unsigned = a;
+        }
+        return Ok(vec![s]);
+    }
+    let mut out: Vec<RegistrySource> = Vec::with_capacity(raw.registries.len());
+    for (i, r) in raw.registries.iter().enumerate() {
+        if r.name.trim().is_empty() {
+            return Err(format!("registries[{}]: name must be non-empty", i + 1));
+        }
+        if r.url.trim().is_empty() {
+            return Err(format!(
+                "registries[{}] ({}): url must be non-empty",
+                i + 1,
+                r.name
+            ));
+        }
+        if let Some(prev) = out.iter().position(|s| s.name == r.name) {
+            return Err(format!(
+                "duplicate registry name '{}' (entries {} and {})",
+                r.name,
+                prev + 1,
+                i + 1
+            ));
+        }
+        out.push(RegistrySource {
+            name: r.name.clone(),
+            url: r.url.clone(),
+            public_key: r.public_key.clone(),
+            allow_unsigned: r.allow_unsigned,
+            cache_ttl_secs: r.cache_ttl_secs.unwrap_or(DEFAULT_CACHE_TTL_SECS),
+            enabled: r.enabled,
+        });
+    }
+    Ok(out)
+}
+
+/// Precedence tier between CLI flags and config: env vars override the
+/// effective (first) source's fields in place — the name is kept so per-source
+/// caches and ledger origins stay stable. Empty values are ignored so a
+/// stray `VYNM_REGISTRY_URL=""` cannot blank a good URL.
+fn apply_env_overrides(sources: &mut [RegistrySource]) {
+    let Some(first) = sources.first_mut() else {
+        return;
+    };
+    if let Ok(url) = std::env::var("VYNM_REGISTRY_URL") {
+        if !url.trim().is_empty() {
+            first.url = url;
+        }
+    }
+    if let Ok(key) = std::env::var("VYNM_MARKETPLACE_PUBLIC_KEY") {
+        if !key.trim().is_empty() {
+            first.public_key = Some(key);
+        }
+    }
 }
 
 /// Resolve the drop-in plugin dir — ported verbatim from the kernel's
@@ -76,9 +181,13 @@ pub fn resolve_plugins_dir(config_path: &str, explicit: Option<&Path>) -> PathBu
 }
 
 /// Everything a command needs, resolved from `--config`.
+#[derive(Debug)]
 pub struct Ctx {
     pub plugins_dir: PathBuf,
-    pub source: RegistrySource,
+    /// configured sources in listed order; `[0]` is the effective default.
+    /// V-09: resolution (--source, bare-slug search, explicit `name/slug`)
+    /// works over this list.
+    pub sources: Vec<RegistrySource>,
     /// Fallback base for state/plugin dirs when `$HOME`/XDG are unset —
     /// private per-process scratch, never the shared world-writable /tmp root.
     pub tmp_dir: PathBuf,
@@ -95,34 +204,38 @@ impl Ctx {
                 .map_err(|e| VynmError::InvalidInput(format!("{}: {e}", config_path)))?,
             Err(_) => RawConfig::default(), // no config yet → pure defaults
         };
-        let mut source = official_source();
-        if let Some(url) = raw.registry_url {
-            // back-compat single-key override maps onto the official entry
-            source.url = url;
-        }
-        if let Some(key) = raw.marketplace_public_key {
-            source.public_key = Some(key);
-        }
-        if let Some(ttl) = raw.registry_cache_ttl_secs {
-            source.cache_ttl_secs = ttl;
-        }
+        let mut sources = build_sources(&raw)
+            .map_err(|e| VynmError::InvalidInput(format!("{config_path}: {e}")))?;
+        apply_env_overrides(&mut sources);
         Ok(Self {
             plugins_dir: resolve_plugins_dir(config_path, raw.plugins_dir.as_deref()),
-            source,
+            sources,
             tmp_dir: scratch_base(),
         })
     }
 
-    /// §6.5: `--source <name>` validates against the configured list — one
-    /// name today; adding N sources changes this lookup only, not the CLI.
+    /// configured source names, in listed order — error listings use this
+    pub fn source_names(&self) -> Vec<&str> {
+        self.sources.iter().map(|s| s.name.as_str()).collect()
+    }
+
+    /// §6.5: `--source <name>` exact-matches against the configured list;
+    /// None → the effective default (`sources[0]`). Unknown → error listing
+    /// all configured names.
     pub fn resolve_source(&self, requested: Option<&str>) -> Result<RegistrySource, VynmError> {
         match requested {
-            None => Ok(self.source.clone()),
-            Some(name) if name == self.source.name => Ok(self.source.clone()),
-            Some(other) => Err(VynmError::InvalidInput(format!(
-                "unknown source '{other}' — configured sources: {}",
-                self.source.name
-            ))),
+            None => Ok(self.sources[0].clone()),
+            Some(name) => self
+                .sources
+                .iter()
+                .find(|s| s.name == name)
+                .cloned()
+                .ok_or_else(|| {
+                    VynmError::InvalidInput(format!(
+                        "unknown source '{name}' — configured sources: {}",
+                        self.source_names().join(", ")
+                    ))
+                }),
         }
     }
 }
@@ -157,6 +270,9 @@ pub enum Command {
         /// Registry source name (see the configured sources)
         #[arg(long)]
         source: Option<String>,
+        /// Skip the permission confirmation prompt (V-10) — for scripts/CI
+        #[arg(long)]
+        yes: bool,
     },
     /// Search the registry
     Search {
@@ -268,15 +384,17 @@ pub async fn run(cli: &Cli) -> Result<(), VynmError> {
     }
     let ctx = Ctx::load(&cli.config)?;
     match &cli.command {
-        Command::Install { slug, source } => {
-            let src = ctx.resolve_source(source.as_deref())?;
-            install_cmd(&ctx, &src, slug).await
+        Command::Install { slug, source, yes } => {
+            let pinned = pin_source(&ctx, source.as_deref(), slug)?;
+            install_cmd(&ctx, pinned.as_ref(), slug, *yes)
+                .await
+                .map(|_| ())
         }
         Command::Search { query, source } => {
-            let src = ctx.resolve_source(source.as_deref())?;
-            search_cmd(&ctx, &src, query).await
+            let pinned = pin_source(&ctx, source.as_deref(), query)?;
+            search_cmd(&ctx, pinned.as_ref(), query).await.map(|_| ())
         }
-        Command::List { .. } => list_cmd(&ctx),
+        Command::List { source } => list_cmd(&ctx, source.as_deref()),
         Command::Remove { slug } => remove_cmd(&ctx, slug),
         Command::Enable { slug } => enable_cmd(&ctx, slug),
         Command::Disable { slug } => disable_cmd(&ctx, slug),
@@ -285,16 +403,205 @@ pub async fn run(cli: &Cli) -> Result<(), VynmError> {
     }
 }
 
-async fn install_cmd(ctx: &Ctx, src: &RegistrySource, target: &str) -> Result<(), VynmError> {
-    let entries: Vec<RegistryEntry> = fetch_registry(src, false, &ctx.tmp_dir).await?;
+// ── §7.2 resolution engine (V-09) ───────────────────────────────────────────
+
+/// Which source a target resolved against, so commands can attribute it
+/// (`resolved from <name>`) and tests can assert attribution without
+/// scraping stdout.
+pub struct ResolutionReceipt {
+    pub source_name: String,
+}
+
+/// §7.2 target grammar: `corp/database` → Some(("corp", "database")). Slugs
+/// never contain '/' (MA-17 charset), so the first slash is always the split;
+/// anything else is a bare slug.
+fn split_target(target: &str) -> Option<(&str, &str)> {
+    match target.split_once('/') {
+        Some((name, slug)) if !name.is_empty() && !slug.is_empty() => Some((name, slug)),
+        _ => None,
+    }
+}
+
+/// (--source flag, target) → explicitly pinned source, or None = generic
+/// bare-slug resolution. Explicit forms never search: an unknown name errors
+/// listing every configured source.
+fn pin_source(
+    ctx: &Ctx,
+    flag: Option<&str>,
+    target: &str,
+) -> Result<Option<RegistrySource>, VynmError> {
+    if let Some(name) = flag {
+        return Ok(Some(ctx.resolve_source(Some(name))?));
+    }
+    match split_target(target) {
+        Some((name, _)) => Ok(Some(ctx.resolve_source(Some(name))?)),
+        None => Ok(None),
+    }
+}
+
+/// Bare-slug probe order: enabled sources in listed order, except that a
+/// ledger-recorded origin (§6.2) goes first — reinstalls/updates of an
+/// installed plugin must hit the same channel it came from before generic
+/// search can shadow it. A disabled or since-unconfigured origin falls out.
+fn bare_slug_candidates(
+    sources: &[RegistrySource],
+    ledger_origin: Option<&str>,
+) -> Vec<RegistrySource> {
+    let mut out = Vec::new();
+    if let Some(origin) = ledger_origin {
+        if let Some(s) = sources.iter().find(|s| s.name == origin && s.enabled) {
+            out.push(s.clone());
+        }
+    }
+    for s in sources {
+        if s.enabled && !out.iter().any(|o| o.name == s.name) {
+            out.push(s.clone());
+        }
+    }
+    out
+}
+
+enum ProbeOutcome {
+    Found(RegistrySource, Vec<RegistryEntry>),
+    NoMatch(Vec<String>),
+}
+
+/// Try candidates in order; the first source whose entries satisfy `wants`
+/// wins. A fetch error skips to the next source (warned); when NO candidate
+/// could be fetched at all, the last error propagates unchanged so exit-code
+/// mapping (network=2 etc.) survives multi-source probing.
+async fn probe_sources(
+    candidates: &[RegistrySource],
+    tmp_dir: &Path,
+    wants: impl Fn(&[RegistryEntry]) -> bool,
+) -> Result<ProbeOutcome, VynmError> {
+    let mut last_err = None;
+    let mut fetched_any = false;
+    for src in candidates {
+        match fetch_registry(src, false, tmp_dir).await {
+            Ok(entries) => {
+                fetched_any = true;
+                if wants(&entries) {
+                    return Ok(ProbeOutcome::Found(src.clone(), entries));
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "registry '{}': fetch failed ({e}) — moving to the next source",
+                    src.name
+                );
+                last_err = Some(e);
+            }
+        }
+    }
+    if !fetched_any {
+        return Err(last_err
+            .unwrap_or_else(|| VynmError::Internal("no registry sources configured".into())));
+    }
+    Ok(ProbeOutcome::NoMatch(
+        candidates.iter().map(|s| s.name.clone()).collect(),
+    ))
+}
+
+// ── V-10 install confirmation gate ─────────────────────────────────────────
+
+/// Which path the permission gate takes. Pure decision so tests pin every
+/// branch without a TTY.
+#[derive(Debug, PartialEq, Eq)]
+enum ConfirmMode {
+    AutoYes,
+    Interactive,
+    NonInteractiveRefusal,
+}
+
+fn confirm_mode(explicit_yes: bool, interactive: bool) -> ConfirmMode {
+    if explicit_yes {
+        ConfirmMode::AutoYes
+    } else if interactive {
+        ConfirmMode::Interactive
+    } else {
+        ConfirmMode::NonInteractiveRefusal
+    }
+}
+
+/// The gate handed to [`install`]: previews the parsed staged manifest and
+/// asks the operator before anything user-visible happens. Default NO — only
+/// an explicit y/Y accepts (empty line = refusal). `interactive` is injected
+/// for tests; prod passes stdin's TTY status (§7.3 pattern).
+fn confirm_install(
+    manifest: &InstallManifest,
+    explicit_yes: bool,
+    interactive: bool,
+) -> Result<(), VynmError> {
+    match confirm_mode(explicit_yes, interactive) {
+        ConfirmMode::AutoYes => Ok(()),
+        ConfirmMode::NonInteractiveRefusal => Err(VynmError::Internal(
+            "refusing to grant undeclared-review permissions in a non-interactive run \
+             — pass --yes to accept"
+                .into(),
+        )),
+        ConfirmMode::Interactive => {
+            print!("{}", format_permission_preview(manifest));
+            println!(
+                "install {}@{} with the above permissions? [y/N] ",
+                manifest.plugin_id, manifest.version
+            );
+            std::io::stdout().flush().map_err(VynmError::Io)?;
+            let mut line = String::new();
+            match std::io::stdin().read_line(&mut line) {
+                Ok(_) if line.trim().eq_ignore_ascii_case("y") => Ok(()),
+                _ => Err(VynmError::Internal(format!(
+                    "install of '{}' refused by operator",
+                    manifest.plugin_id
+                ))),
+            }
+        }
+    }
+}
+
+async fn install_cmd(
+    ctx: &Ctx,
+    pinned: Option<&RegistrySource>,
+    target: &str,
+    yes: bool,
+) -> Result<ResolutionReceipt, VynmError> {
+    let slug = split_target(target).map(|(_, s)| s).unwrap_or(target);
+    let (src, entries) = match pinned {
+        Some(src) => {
+            let entries = fetch_registry(src, false, &ctx.tmp_dir).await?;
+            (src.clone(), entries)
+        }
+        None => {
+            let ledger = load_state(&ctx.tmp_dir);
+            let origin = ledger.get(slug).map(|e| e.source.as_str());
+            let candidates = bare_slug_candidates(&ctx.sources, origin);
+            match probe_sources(&candidates, &ctx.tmp_dir, |entries| {
+                entries.iter().any(|e| e.slug == slug || e.id == slug)
+            })
+            .await?
+            {
+                ProbeOutcome::Found(src, entries) => (src, entries),
+                ProbeOutcome::NoMatch(tried) => {
+                    return Err(VynmError::Internal(format!(
+                        "Plugin '{slug}' not found in any configured source (tried: {}). \
+                         Run 'vynm search {slug}' to browse.",
+                        tried.join(", ")
+                    )));
+                }
+            }
+        }
+    };
+
+    println!("resolved from {}", src.name);
     let installed = install(
         &entries,
-        target,
-        src,
+        slug,
+        &src,
         &ctx.tmp_dir,
         MAX_ARCHIVE_BYTES,
         MAX_EXTRACTED_BYTES,
         MAX_ARCHIVE_ENTRIES,
+        |manifest| confirm_install(manifest, yes, std::io::stdin().is_terminal()),
     )
     .await?;
 
@@ -320,45 +627,103 @@ async fn install_cmd(ctx: &Ctx, src: &RegistrySource, target: &str) -> Result<()
                 .display()
         ),
     }
-    Ok(())
+    Ok(ResolutionReceipt {
+        source_name: src.name,
+    })
 }
 
-async fn search_cmd(ctx: &Ctx, src: &RegistrySource, query: &str) -> Result<(), VynmError> {
-    let entries: Vec<RegistryEntry> = fetch_registry(src, false, &ctx.tmp_dir).await?;
-
-    let q = query.to_ascii_lowercase();
-    let mut hits: Vec<&RegistryEntry> = entries
+/// search hits for a lowercased query — shared by the probe predicate and
+/// the table printer so both see exactly the same matches (owned clones: the
+/// probe's registry document doesn't outlive resolution)
+fn matching_entries(entries: &[RegistryEntry], q: &str) -> Vec<RegistryEntry> {
+    let mut hits: Vec<RegistryEntry> = entries
         .iter()
         .filter(|e| {
-            e.slug.to_ascii_lowercase().contains(&q)
-                || e.name.to_ascii_lowercase().contains(&q)
-                || e.description.to_ascii_lowercase().contains(&q)
+            e.slug.to_ascii_lowercase().contains(q)
+                || e.name.to_ascii_lowercase().contains(q)
+                || e.description.to_ascii_lowercase().contains(q)
         })
+        .cloned()
         .collect();
     hits.sort_by(|a, b| a.slug.cmp(&b.slug));
-    if hits.is_empty() {
-        println!("no matches for '{query}'");
-        return Ok(());
-    }
+    hits
+}
+
+/// `None` = nothing matched anywhere — still exit 0, like single-source era.
+async fn search_cmd(
+    ctx: &Ctx,
+    pinned: Option<&RegistrySource>,
+    query: &str,
+) -> Result<Option<ResolutionReceipt>, VynmError> {
+    let q = query.to_ascii_lowercase();
+    let wants = |entries: &[RegistryEntry]| !matching_entries(entries, &q).is_empty();
+
+    let (source_name, hits): (String, Vec<RegistryEntry>) = match pinned {
+        Some(src) => {
+            let entries = fetch_registry(src, false, &ctx.tmp_dir).await?;
+            let hits = matching_entries(&entries, &q);
+            if hits.is_empty() {
+                println!("no matches for '{query}'");
+                return Ok(None);
+            }
+            (src.name.clone(), hits)
+        }
+        None => {
+            // bare query: ledger-origin lookup only fires when the query is
+            // verbatim a slug; otherwise plain listed order applies
+            let ledger = load_state(&ctx.tmp_dir);
+            let origin = ledger.get(query).map(|e| e.source.as_str());
+            let candidates = bare_slug_candidates(&ctx.sources, origin);
+            match probe_sources(&candidates, &ctx.tmp_dir, wants).await? {
+                ProbeOutcome::Found(src, entries) => {
+                    let hits = matching_entries(&entries, &q);
+                    if hits.is_empty() {
+                        println!("no matches for '{query}'");
+                        return Ok(None);
+                    }
+                    (src.name.clone(), hits)
+                }
+                ProbeOutcome::NoMatch(_) => {
+                    println!("no matches for '{query}'");
+                    return Ok(None);
+                }
+            }
+        }
+    };
+
+    println!("resolved from {source_name}");
     println!("{:<24} {:<10} {:<10} NAME", "SLUG", "VERSION", "STATUS");
     for e in hits {
         let status = if e.is_revoked() { "revoked" } else { &e.status };
         println!("{:<24} {:<10} {:<10} {}", e.slug, e.version, status, e.name);
     }
-    Ok(())
+    Ok(Some(ResolutionReceipt { source_name }))
 }
 
-fn list_cmd(ctx: &Ctx) -> Result<(), VynmError> {
+/// `--source <name>` filters rows by their recorded ledger origin; the name
+/// is validated against the configured list even when nothing is installed.
+fn list_cmd(ctx: &Ctx, source: Option<&str>) -> Result<(), VynmError> {
+    let want = source
+        .map(|n| ctx.resolve_source(Some(n)).map(|_| n.to_string()))
+        .transpose()?;
     let state = load_state(&ctx.tmp_dir);
-    if state.entries.is_empty() {
-        println!("no plugins installed");
+    let rows: Vec<_> = state
+        .entries
+        .iter()
+        .filter(|e| want.as_deref().is_none_or(|w| e.source == w))
+        .collect();
+    if rows.is_empty() {
+        match &want {
+            Some(w) => println!("no plugins installed from '{w}'"),
+            None => println!("no plugins installed"),
+        }
         return Ok(());
     }
     println!(
         "{:<24} {:<10} {:<12} {:<20} PATH",
         "SLUG", "VERSION", "SOURCE", "INSTALLED AT"
     );
-    for e in &state.entries {
+    for e in rows {
         println!(
             "{:<24} {:<10} {:<12} {:<20} {}",
             e.slug,

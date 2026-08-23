@@ -12,10 +12,11 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
 use tempfile::{tempdir, TempDir};
 use vynkor_manager::dropin::{disable_plugin_config, enable_plugin_config, plugin_dir, Toggle};
-use vynkor_manager::installer::{extract_zip, install, skip_reinstall};
+use vynkor_manager::installer::{extract_zip, format_permission_preview, install, skip_reinstall};
 use vynkor_manager::registry::{signed_message, RegistryEntry};
 use vynkor_manager::source::RegistrySource;
 use vynkor_manager::state::{load_state, record_install};
+use vynkor_manager::VynmError;
 
 const MAX_ARCHIVE: u64 = 1024 * 1024;
 const MAX_EXTRACTED: u64 = 1024 * 1024;
@@ -149,6 +150,7 @@ async fn install_refuses_revoked_entry() {
         MAX_ARCHIVE,
         MAX_EXTRACTED,
         MAX_ENTRIES,
+        |_| Ok(()),
     )
     .await
     .unwrap_err();
@@ -186,6 +188,7 @@ async fn install_end_to_end_happy_path() {
         MAX_ARCHIVE,
         MAX_EXTRACTED,
         MAX_ENTRIES,
+        |_| Ok(()),
     )
     .await
     .unwrap();
@@ -234,6 +237,7 @@ async fn install_flows_manifest_sandbox_false_through() {
         MAX_ARCHIVE,
         MAX_EXTRACTED,
         MAX_ENTRIES,
+        |_| Ok(()),
     )
     .await
     .unwrap();
@@ -271,6 +275,7 @@ async fn install_rejects_wrong_digest() {
         MAX_ARCHIVE,
         MAX_EXTRACTED,
         MAX_ENTRIES,
+        |_| Ok(()),
     )
     .await
     .unwrap_err();
@@ -316,6 +321,7 @@ async fn install_requires_signature_when_source_has_key() {
         MAX_ARCHIVE,
         MAX_EXTRACTED,
         MAX_ENTRIES,
+        |_| Ok(()),
     )
     .await
     .unwrap_err();
@@ -357,6 +363,7 @@ async fn unsigned_source_skips_signature_but_keeps_digest_gate() {
         MAX_ARCHIVE,
         MAX_EXTRACTED,
         MAX_ENTRIES,
+        |_| Ok(()),
     )
     .await
     .unwrap();
@@ -374,6 +381,7 @@ async fn unsigned_source_skips_signature_but_keeps_digest_gate() {
         MAX_ARCHIVE,
         MAX_EXTRACTED,
         MAX_ENTRIES,
+        |_| Ok(()),
     )
     .await
     .unwrap_err();
@@ -413,9 +421,10 @@ async fn install_has_no_compat_gate_against_unreachable_kernel() {
         MAX_ARCHIVE,
         MAX_EXTRACTED,
         MAX_ENTRIES,
+        |_| Ok(()),
     )
     .await
-    .unwrap_or_else(|e| panic!("D2: unreachable kernel must not block installs: {e}"));
+    .unwrap();
     assert_eq!(installed.slug, "future-plugin");
 }
 
@@ -519,6 +528,7 @@ async fn disable_enable_cycle_after_real_install() {
         MAX_ARCHIVE,
         MAX_EXTRACTED,
         MAX_ENTRIES,
+        |_| Ok(()),
     )
     .await
     .unwrap();
@@ -685,4 +695,166 @@ fn zip_bomb_decompressed_size_capped() {
         err.to_string().contains("decompressed size exceeds max"),
         "unexpected: {err}"
     );
+}
+
+// ── V-10 permission preview + confirmation gate ─────────────────────────────
+
+fn preview_manifest() -> vynkor_wire::manifest::InstallManifest {
+    serde_json::from_str(
+        r#"{
+        "plugin_id": "mixed",
+        "version": "2.0.0",
+        "permissions": ["storage", "network"],
+        "binary": "bin",
+        "kernel_compatibility_range": {"min": "0.1.0", "max": "*"},
+        "actions": [
+            "legacy-act",
+            {"name": "fetch", "permission": "storage"},
+            {"name": "exec"}
+        ]
+    }"#,
+    )
+    .unwrap()
+}
+
+#[test]
+fn preview_lists_permissions_and_every_action_requirement() {
+    let out = format_permission_preview(&preview_manifest());
+    assert!(
+        out.contains("permissions: storage, network"),
+        "unexpected: {out}"
+    );
+    // legacy string action → unrestricted
+    assert!(
+        out.contains("legacy-act -> unrestricted"),
+        "unexpected: {out}"
+    );
+    // v2 with a permission → the permission
+    assert!(out.contains("fetch -> storage"), "unexpected: {out}");
+    // v2 without one → unrestricted
+    assert!(out.contains("exec -> unrestricted"), "unexpected: {out}");
+}
+
+#[test]
+fn preview_of_empty_manifest_says_none() {
+    let m: vynkor_wire::manifest::InstallManifest = serde_json::from_str(
+        r#"{
+        "plugin_id": "bare",
+        "version": "1.0.0",
+        "permissions": [],
+        "binary": "b",
+        "kernel_compatibility_range": {"min": "0.1.0", "max": "*"}
+    }"#,
+    )
+    .unwrap();
+    let out = format_permission_preview(&m);
+    assert_eq!(out, "permissions: (none)\n");
+}
+
+// refusal aborts exactly like failed validation: dest/bak untouched, ledger
+// unrecorded, no drop-in, staging cleaned — and the gate provably fires
+// BEFORE the swap with the real parsed manifest in hand
+#[tokio::test]
+async fn install_gate_refusal_leaves_zero_trace() {
+    let sandbox = Sandbox::new();
+    let tmp = sandbox.dir.path();
+    let mut server = mockito::Server::new_async().await;
+    let (archive, hash) = build_archive(
+        "guarded",
+        r#", "actions":[{"name":"fetch","permission":"storage"}]"#,
+    );
+    let url = format!("{}/guarded.zip", server.url());
+    server
+        .mock("GET", "/guarded.zip")
+        .with_status(200)
+        .with_body(archive)
+        .create_async()
+        .await;
+
+    let (sk, pk_hex) = test_signer();
+    let entry = signed_archive_entry(&sk, "guarded", &url, &hash, "0.1.0");
+    let src = test_source("https://registry.example", Some(pk_hex));
+
+    let base = plugin_dir(tmp);
+    let dest = base.join("guarded");
+    let err = install(
+        &[entry],
+        "guarded",
+        &src,
+        tmp,
+        MAX_ARCHIVE,
+        MAX_EXTRACTED,
+        MAX_ENTRIES,
+        |manifest| {
+            // preview uses the REAL parsed manifest of the staged copy:
+            // the v2 action requirement survived parse + validation
+            let req = manifest
+                .actions
+                .as_ref()
+                .and_then(|a| a.first())
+                .and_then(|s| s.permission());
+            assert_eq!(req, Some("storage"));
+            // gate ordering: nothing user-visible exists yet
+            assert!(!dest.exists(), "gate must fire before the swap");
+            Err(VynmError::Internal("operator said no".into()))
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert!(err.to_string().contains("operator said no"));
+    assert!(!dest.exists(), "dest untouched");
+    assert!(!base.join("guarded.bak").exists(), "no bak left behind");
+    assert!(
+        load_state(tmp).get("guarded").is_none(),
+        "ledger not recorded"
+    );
+    assert!(
+        !tmp.join("plugins.d").join("guarded.yaml").exists(),
+        "no drop-in written"
+    );
+    assert!(
+        !base.join(".install-tmp-guarded").exists(),
+        "staging cleaned"
+    );
+}
+
+// §7.3 consent Yes + V-10 gate Yes: worst-case two-question flow completes
+#[tokio::test]
+async fn unsigned_consent_then_gate_yes_still_installs() {
+    let sandbox = Sandbox::new();
+    let tmp = sandbox.dir.path();
+    let mut server = mockito::Server::new_async().await;
+    let (archive, hash) = build_archive("two-ask", "");
+    let url = format!("{}/two-ask.zip", server.url());
+    server
+        .mock("GET", "/two-ask.zip")
+        .with_status(200)
+        .with_body(archive)
+        .create_async()
+        .await;
+
+    // unsigned entry on an unsigned-consented source: consent prompt would
+    // fire at fetch time; here unit-level it means no public_key configured
+    let mut entry = make_entry("two-ask", "0.1.0", "*");
+    entry.archive_url = url;
+    entry.sha256 = hash;
+    let mut src = test_source("https://registry.example", None);
+    src.allow_unsigned = true;
+
+    let installed = install(
+        &[entry],
+        "two-ask",
+        &src,
+        tmp,
+        MAX_ARCHIVE,
+        MAX_EXTRACTED,
+        MAX_ENTRIES,
+        |_| Ok(()), // gate answered yes
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(installed.slug, "two-ask");
+    assert!(load_state(tmp).get("two-ask").is_some(), "ledger recorded");
 }
