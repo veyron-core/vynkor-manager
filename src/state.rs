@@ -16,6 +16,10 @@ pub const LEDGER_SCHEMA_VERSION: u32 = 3;
 /// origin source name recorded for installs made before multi-source existed.
 pub const DEFAULT_SOURCE: &str = "official";
 
+/// origin source name for V-15 archive-mode installs — V-12 treats these as
+/// never-updatable via registries (no registry owns their content).
+pub const LOCAL_SOURCE: &str = "local";
+
 fn default_source() -> String {
     DEFAULT_SOURCE.to_string()
 }

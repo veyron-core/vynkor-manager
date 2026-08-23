@@ -240,9 +240,9 @@ impl Ctx {
 }
 
 // install size caps — operator-tunable knobs land with V-09 config layering
-const MAX_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
-const MAX_EXTRACTED_BYTES: u64 = 1024 * 1024 * 1024;
-const MAX_ARCHIVE_ENTRIES: usize = 100_000;
+pub(crate) const MAX_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
+pub(crate) const MAX_EXTRACTED_BYTES: u64 = 1024 * 1024 * 1024;
+pub(crate) const MAX_ARCHIVE_ENTRIES: usize = 100_000;
 
 // ── clap surface ────────────────────────────────────────────────────────────
 
@@ -303,6 +303,22 @@ pub enum Command {
     Verify {
         /// restrict the check to one installed plugin
         slug: Option<String>,
+    },
+    /// Report installed plugins vs their ORIGIN registries (V-12). Report
+    /// only — always exits 0.
+    Outdated,
+    /// Update installed plugins from their origin sources (V-12). Batch plan,
+    /// ONE confirmation; strictly-newer versions only. Equal version with a
+    /// different digest is a rebuild — needs --force. Downgrades never apply.
+    Update {
+        /// restrict the update to one installed plugin
+        slug: Option<String>,
+        /// reinstall equal-version-different-digest entries (rebuilds)
+        #[arg(long)]
+        force: bool,
+        /// skip the batch confirmation prompt (scripts/CI)
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
     /// Generate an ed25519 signing key pair for registry publishing (V-14)
     Keygen {
@@ -428,6 +444,10 @@ pub async fn run(cli: &Cli) -> Result<(), VynmError> {
         Command::Enable { slug } => enable_cmd(&ctx, slug),
         Command::Disable { slug } => disable_cmd(&ctx, slug),
         Command::Verify { slug } => crate::verify::verify_cmd(&ctx.tmp_dir, slug.as_deref()),
+        Command::Outdated => crate::update::outdated_cmd(&ctx).await,
+        Command::Update { slug, force, yes } => {
+            crate::update::update_cmd(&ctx, slug.as_deref(), *force, *yes).await
+        }
         // all handled above, before Ctx::load
         Command::Keygen { .. } | Command::Sign { .. } | Command::New { .. } => Ok(()),
     }
@@ -453,15 +473,15 @@ fn split_target(target: &str) -> Option<(&str, &str)> {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct Target<'a> {
+pub(crate) struct Target<'a> {
     /// named source (`corp/slug`), or None = generic resolution
-    source: Option<&'a str>,
-    slug: &'a str,
+    pub(crate) source: Option<&'a str>,
+    pub(crate) slug: &'a str,
     /// exact-version pin (`slug@0.1.0`, V-11)
-    version: Option<&'a str>,
+    pub(crate) version: Option<&'a str>,
 }
 
-fn parse_target(target: &str) -> Target<'_> {
+pub(crate) fn parse_target(target: &str) -> Target<'_> {
     // split the pin off first so `corp/database@0.1.0` splits on the slash
     // that precedes the '@' — an empty head/version leaves the target whole,
     // which then fails downstream matching like any unknown slug.

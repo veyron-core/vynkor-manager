@@ -540,7 +540,7 @@ pub async fn install_archive(
         &slug,
         None, // D2: kernel compat re-validated authoritatively at boot
         actual_hash,
-        "local",
+        crate::state::LOCAL_SOURCE,
         &source_url,
         max_extracted_bytes,
         max_archive_entries,
