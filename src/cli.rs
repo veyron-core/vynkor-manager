@@ -387,7 +387,7 @@ pub async fn run(cli: &Cli) -> Result<(), VynmError> {
             let pinned = pin_source(&ctx, source.as_deref(), query)?;
             search_cmd(&ctx, pinned.as_ref(), query).await.map(|_| ())
         }
-        Command::List { .. } => list_cmd(&ctx),
+        Command::List { source } => list_cmd(&ctx, source.as_deref()),
         Command::Remove { slug } => remove_cmd(&ctx, slug),
         Command::Enable { slug } => enable_cmd(&ctx, slug),
         Command::Disable { slug } => disable_cmd(&ctx, slug),
@@ -635,17 +635,30 @@ async fn search_cmd(
     Ok(Some(ResolutionReceipt { source_name }))
 }
 
-fn list_cmd(ctx: &Ctx) -> Result<(), VynmError> {
+/// `--source <name>` filters rows by their recorded ledger origin; the name
+/// is validated against the configured list even when nothing is installed.
+fn list_cmd(ctx: &Ctx, source: Option<&str>) -> Result<(), VynmError> {
+    let want = source
+        .map(|n| ctx.resolve_source(Some(n)).map(|_| n.to_string()))
+        .transpose()?;
     let state = load_state(&ctx.tmp_dir);
-    if state.entries.is_empty() {
-        println!("no plugins installed");
+    let rows: Vec<_> = state
+        .entries
+        .iter()
+        .filter(|e| want.as_deref().is_none_or(|w| e.source == w))
+        .collect();
+    if rows.is_empty() {
+        match &want {
+            Some(w) => println!("no plugins installed from '{w}'"),
+            None => println!("no plugins installed"),
+        }
         return Ok(());
     }
     println!(
         "{:<24} {:<10} {:<12} {:<20} PATH",
         "SLUG", "VERSION", "SOURCE", "INSTALLED AT"
     );
-    for e in &state.entries {
+    for e in rows {
         println!(
             "{:<24} {:<10} {:<12} {:<20} {}",
             e.slug,
