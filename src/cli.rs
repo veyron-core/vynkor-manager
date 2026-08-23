@@ -15,11 +15,10 @@ use crate::dropin::{
     write_plugin_config, DropinParams, Toggle,
 };
 use crate::error::VynmError;
-use crate::installer::{format_permission_preview, install};
+use crate::installer::{format_permission_preview, install, install_archive, ArchiveOrigin};
 use crate::registry::{fetch_registry, RegistryEntry};
 use crate::source::{official_source, RegistrySource};
 use crate::state::{format_ts, load_state};
-
 // ── exit codes — the scripting contract (0 ok / 1 failure / 2 network /
 // 3 verification; finalized in V-16) ─────────────────────────────────────────
 
@@ -264,7 +263,11 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Install a plugin from a registry into the kernel's plugin tree
+    /// Install a plugin from a registry, or a local archive / direct archive
+    /// URL (V-15). Ambiguity rule: an argument starting with http(s)://,
+    /// `./`, `../` or `/`, or ending in `.zip`, is an ARCHIVE install;
+    /// anything else is `[<source>/]<slug>[@<version>]` against registries.
+    /// Archives are not versioned — `./x.zip@1.0` is a hard error.
     Install {
         slug: String,
         /// Registry source name (see the configured sources)
@@ -273,6 +276,10 @@ pub enum Command {
         /// Skip the permission confirmation prompt (V-10) — for scripts/CI
         #[arg(long)]
         yes: bool,
+        /// V-15 archive installs only: accept insecure http:// direct archive
+        /// URLs (the archive-mode equivalent of allow_unsigned on a source)
+        #[arg(long)]
+        allow_unsigned: bool,
     },
     /// Search the registry
     Search {
@@ -291,6 +298,12 @@ pub enum Command {
     Enable { slug: String },
     /// Stop auto-spawning an installed plugin (drop-in renamed .disabled)
     Disable { slug: String },
+    /// Verify installed trees against the ledger's tree digests (V-13);
+    /// no slug = every ledger entry
+    Verify {
+        /// restrict the check to one installed plugin
+        slug: Option<String>,
+    },
     /// Generate an ed25519 signing key pair for registry publishing (V-14)
     Keygen {
         /// Name for the default output path (<name>.key)
@@ -384,12 +397,28 @@ pub async fn run(cli: &Cli) -> Result<(), VynmError> {
     }
     let ctx = Ctx::load(&cli.config)?;
     match &cli.command {
-        Command::Install { slug, source, yes } => {
-            let pinned = pin_source(&ctx, source.as_deref(), slug)?;
-            install_cmd(&ctx, pinned.as_ref(), slug, *yes)
-                .await
-                .map(|_| ())
-        }
+        Command::Install {
+            slug,
+            source,
+            yes,
+            allow_unsigned,
+        } => match classify_install_target(slug)? {
+            // V-15 archive mode: no registry resolution, --source is a misuse
+            InstallKind::Archive => {
+                if source.is_some() {
+                    return Err(VynmError::InvalidInput(
+                        "--source does not apply to local-archive/direct-URL installs".into(),
+                    ));
+                }
+                install_archive_cmd(&ctx, slug, *allow_unsigned, *yes).await
+            }
+            InstallKind::Registry => {
+                let pinned = pin_source(&ctx, source.as_deref(), slug)?;
+                install_cmd(&ctx, pinned.as_ref(), slug, *yes)
+                    .await
+                    .map(|_| ())
+            }
+        },
         Command::Search { query, source } => {
             let pinned = pin_source(&ctx, source.as_deref(), query)?;
             search_cmd(&ctx, pinned.as_ref(), query).await.map(|_| ())
@@ -398,6 +427,7 @@ pub async fn run(cli: &Cli) -> Result<(), VynmError> {
         Command::Remove { slug } => remove_cmd(&ctx, slug),
         Command::Enable { slug } => enable_cmd(&ctx, slug),
         Command::Disable { slug } => disable_cmd(&ctx, slug),
+        Command::Verify { slug } => crate::verify::verify_cmd(&ctx.tmp_dir, slug.as_deref()),
         // all handled above, before Ctx::load
         Command::Keygen { .. } | Command::Sign { .. } | Command::New { .. } => Ok(()),
     }
@@ -412,14 +442,76 @@ pub struct ResolutionReceipt {
     pub source_name: String,
 }
 
-/// §7.2 target grammar: `corp/database` → Some(("corp", "database")). Slugs
-/// never contain '/' (MA-17 charset), so the first slash is always the split;
-/// anything else is a bare slug.
+/// §7.2 target grammar (V-11): `[<source>/]<slug>[@<version>]`. Slugs never
+/// contain '/' (MA-17 charset) nor '@', so the first slash is the source
+/// split and the first '@' is the version pin; anything else is a bare slug.
 fn split_target(target: &str) -> Option<(&str, &str)> {
     match target.split_once('/') {
         Some((name, slug)) if !name.is_empty() && !slug.is_empty() => Some((name, slug)),
         _ => None,
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct Target<'a> {
+    /// named source (`corp/slug`), or None = generic resolution
+    source: Option<&'a str>,
+    slug: &'a str,
+    /// exact-version pin (`slug@0.1.0`, V-11)
+    version: Option<&'a str>,
+}
+
+fn parse_target(target: &str) -> Target<'_> {
+    // split the pin off first so `corp/database@0.1.0` splits on the slash
+    // that precedes the '@' — an empty head/version leaves the target whole,
+    // which then fails downstream matching like any unknown slug.
+    let (head, version) = match target.split_once('@') {
+        Some((h, v)) if !h.is_empty() && !v.is_empty() => (h, Some(v)),
+        _ => (target, None),
+    };
+    let (source, slug) = match split_target(head) {
+        Some((s, sl)) => (Some(s), sl),
+        None => (None, head),
+    };
+    Target {
+        source,
+        slug,
+        version,
+    }
+}
+
+/// V-15 install-target kind: registry flow or archive flow.
+#[derive(Debug, PartialEq, Eq)]
+enum InstallKind {
+    Registry,
+    Archive,
+}
+
+/// V-15 disambiguation — [`parse_target`] is consulted FIRST and its pin
+/// split reused; an argument carrying ANY archive indicator
+/// (`http://`/`https://` prefix, `./`/`../`/`/` path prefix, `.zip` suffix)
+/// routes to the archive pipeline instead of registries, while everything
+/// else stays `[<source>/]<slug>[@<version>]` untouched. An `@<version>` pin
+/// combined with archive mode is a hard error — archives are not versioned.
+/// The check runs on the RAW argument: `corp/slug.zip` ends in .zip and is a
+/// local archive, not source `corp`.
+fn classify_install_target(target: &str) -> Result<InstallKind, VynmError> {
+    let parsed = parse_target(target);
+    let is_archive = target.starts_with("http://")
+        || target.starts_with("https://")
+        || target.starts_with("./")
+        || target.starts_with("../")
+        || target.starts_with('/')
+        || target.ends_with(".zip");
+    if !is_archive {
+        return Ok(InstallKind::Registry);
+    }
+    if parsed.version.is_some() {
+        return Err(VynmError::InvalidInput(format!(
+            "'{target}': archives are not versioned — drop the @<version> pin"
+        )));
+    }
+    Ok(InstallKind::Archive)
 }
 
 /// (--source flag, target) → explicitly pinned source, or None = generic
@@ -433,8 +525,8 @@ fn pin_source(
     if let Some(name) = flag {
         return Ok(Some(ctx.resolve_source(Some(name))?));
     }
-    match split_target(target) {
-        Some((name, _)) => Ok(Some(ctx.resolve_source(Some(name))?)),
+    match parse_target(target).source {
+        Some(name) => Ok(Some(ctx.resolve_source(Some(name))?)),
         None => Ok(None),
     }
 }
@@ -559,17 +651,15 @@ fn confirm_install(
     }
 }
 
-async fn install_cmd(
+async fn resolve_unpinned(
     ctx: &Ctx,
     pinned: Option<&RegistrySource>,
-    target: &str,
-    yes: bool,
-) -> Result<ResolutionReceipt, VynmError> {
-    let slug = split_target(target).map(|(_, s)| s).unwrap_or(target);
-    let (src, entries) = match pinned {
+    slug: &str,
+) -> Result<(RegistrySource, Vec<RegistryEntry>), VynmError> {
+    match pinned {
         Some(src) => {
             let entries = fetch_registry(src, false, &ctx.tmp_dir).await?;
-            (src.clone(), entries)
+            Ok((src.clone(), entries))
         }
         None => {
             let ledger = load_state(&ctx.tmp_dir);
@@ -580,16 +670,103 @@ async fn install_cmd(
             })
             .await?
             {
-                ProbeOutcome::Found(src, entries) => (src, entries),
-                ProbeOutcome::NoMatch(tried) => {
-                    return Err(VynmError::Internal(format!(
-                        "Plugin '{slug}' not found in any configured source (tried: {}). \
-                         Run 'vynm search {slug}' to browse.",
-                        tried.join(", ")
-                    )));
-                }
+                ProbeOutcome::Found(src, entries) => Ok((src, entries)),
+                ProbeOutcome::NoMatch(tried) => Err(VynmError::Internal(format!(
+                    "Plugin '{slug}' not found in any configured source (tried: {}). \
+                     Run 'vynm search {slug}' to browse.",
+                    tried.join(", ")
+                ))),
             }
         }
+    }
+}
+
+/// V-11 — exact-version resolution: candidates in bare-slug order (or the
+/// single explicitly pinned source), each fetched and filtered to
+/// `slug AND version == pin`. First source serving the exact version wins;
+/// a miss errors listing what each tried source DOES serve for the slug.
+async fn resolve_pinned(
+    ctx: &Ctx,
+    pinned: Option<&RegistrySource>,
+    slug: &str,
+    version: &str,
+) -> Result<(RegistrySource, Vec<RegistryEntry>), VynmError> {
+    let candidates: Vec<RegistrySource> = match pinned {
+        Some(src) => vec![src.clone()],
+        None => {
+            let ledger = load_state(&ctx.tmp_dir);
+            let origin = ledger.get(slug).map(|e| e.source.as_str());
+            bare_slug_candidates(&ctx.sources, origin)
+        }
+    };
+    // (source name, versions it serves) → the miss report
+    let mut serves: Vec<(String, Vec<String>)> = Vec::new();
+    let mut fetched_any = false;
+    let mut last_err = None;
+    for src in &candidates {
+        match fetch_registry(src, false, &ctx.tmp_dir).await {
+            Ok(entries) => {
+                fetched_any = true;
+                let mut versions: Vec<String> = entries
+                    .iter()
+                    .filter(|e| e.slug == slug || e.id == slug)
+                    .map(|e| e.version.clone())
+                    .collect();
+                versions.sort();
+                versions.dedup();
+                if let Some(hit) = entries
+                    .iter()
+                    .find(|e| (e.slug == slug || e.id == slug) && e.version == version)
+                {
+                    // hand install() ONLY the pinned entry — its internal
+                    // find takes the first slug match, so a multi-version
+                    // document must not let an unpinned version win
+                    return Ok((src.clone(), vec![hit.clone()]));
+                }
+                serves.push((src.name.clone(), versions));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "registry '{}': fetch failed ({e}) — moving to the next source",
+                    src.name
+                );
+                last_err = Some(e);
+            }
+        }
+    }
+    if !fetched_any {
+        return Err(last_err
+            .unwrap_or_else(|| VynmError::Internal("no registry sources configured".into())));
+    }
+    let listing = serves
+        .iter()
+        .map(|(name, vs)| {
+            if vs.is_empty() {
+                format!("{slug}: {name} serves nothing")
+            } else {
+                format!("{slug}: {name} serves {}", vs.join(", "))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(VynmError::Internal(format!(
+        "'{slug}@{version}' not found — available: {listing}"
+    )))
+}
+
+async fn install_cmd(
+    ctx: &Ctx,
+    pinned: Option<&RegistrySource>,
+    target: &str,
+    yes: bool,
+) -> Result<ResolutionReceipt, VynmError> {
+    let t = parse_target(target);
+    let slug = t.slug;
+    let (src, entries) = match t.version {
+        // V-11: exact-version pin — same candidate order as bare slugs
+        // (origin first), filtered to the exact version
+        Some(ver) => resolve_pinned(ctx, pinned, slug, ver).await?,
+        None => resolve_unpinned(ctx, pinned, slug).await?,
     };
 
     println!("resolved from {}", src.name);
@@ -630,6 +807,61 @@ async fn install_cmd(
     Ok(ResolutionReceipt {
         source_name: src.name,
     })
+}
+
+/// V-15 — archive-mode install: local zip or direct URL, no registry involved.
+/// Same gate/swap/record tail as [`install_cmd`]; the ledger records
+/// `source: "local"` so V-12 update resolution can exclude these installs.
+async fn install_archive_cmd(
+    ctx: &Ctx,
+    origin: &str,
+    allow_unsigned: bool,
+    yes: bool,
+) -> Result<(), VynmError> {
+    let kind = if origin.starts_with("http://") || origin.starts_with("https://") {
+        ArchiveOrigin::DirectUrl(origin.to_string())
+    } else {
+        let path = PathBuf::from(origin);
+        if !path.is_file() {
+            return Err(VynmError::InvalidInput(format!("'{origin}': no such file")));
+        }
+        ArchiveOrigin::LocalPath(path)
+    };
+
+    let installed = install_archive(
+        &kind,
+        &ctx.tmp_dir,
+        MAX_ARCHIVE_BYTES,
+        MAX_EXTRACTED_BYTES,
+        MAX_ARCHIVE_ENTRIES,
+        allow_unsigned,
+        |manifest| confirm_install(manifest, yes, std::io::stdin().is_terminal()),
+    )
+    .await?;
+
+    // D3: the manifest's own hint decides the drop-in default (same as registry installs)
+    let params = DropinParams {
+        slug: &installed.slug,
+        plugin_id: &installed.plugin_id,
+        binary_path: &installed.binary_path,
+        sandbox: installed.sandbox_hint,
+    };
+    let written = write_plugin_config(&ctx.plugins_dir, &params)?;
+    match written {
+        true => println!(
+            "   Auto-spawn entry: {}",
+            ctx.plugins_dir
+                .join(format!("{}.yaml", installed.slug))
+                .display()
+        ),
+        false => println!(
+            "   drop-in {} already exists — left untouched",
+            ctx.plugins_dir
+                .join(format!("{}.yaml", installed.slug))
+                .display()
+        ),
+    }
+    Ok(())
 }
 
 /// search hits for a lowercased query — shared by the probe predicate and

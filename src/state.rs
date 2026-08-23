@@ -6,9 +6,12 @@ use serde::{Deserialize, Serialize};
 use crate::error::VynmError;
 
 /// current on-disk schema of `installed.json`. v1 = pre-vynkor kernel ledger
-/// (no `schema_version`, no per-entry `source`); v2 adds both. reads of older
-/// files are migrated in memory — missing fields default, never error.
-pub const LEDGER_SCHEMA_VERSION: u32 = 2;
+/// (no `schema_version`, no per-entry `source`); v2 adds both. v3 adds the
+/// per-entry tree digest (`tree_sha256`, V-13) so installed trees can be
+/// verified offline — the archive `sha256` can't re-hash an extracted tree.
+/// reads of older files are migrated in memory — missing fields default,
+/// never error.
+pub const LEDGER_SCHEMA_VERSION: u32 = 3;
 
 /// origin source name recorded for installs made before multi-source existed.
 pub const DEFAULT_SOURCE: &str = "official";
@@ -31,9 +34,17 @@ pub struct InstalledEntry {
     pub source_url: String,
     /// §6.2 origin source name (`official`, or a configured source name).
     /// updates/reinstalls resolve against it once multiple sources exist;
-    /// pre-v2 ledgers read back as `official`.
+    /// pre-v2 ledgers read back as `official`. V-15: `local` marks an
+    /// archive-mode install — V-12 `update` must treat it as not-updatable
+    /// via registries.
     #[serde(default = "default_source")]
     pub source: String,
+    /// V-13 digest of the INSTALLED TREE at install time (`installer::
+    /// tree_digest`) — the archive `sha256` above can't re-hash an extracted
+    /// tree offline. None = pre-v3 entry, verification reports unknown
+    /// baseline instead of guessing.
+    #[serde(default)]
+    pub tree_sha256: Option<String>,
 }
 
 /// The on-disk shape of `installed.json`. Serialized with pretty JSON so an

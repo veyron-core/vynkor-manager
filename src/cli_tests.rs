@@ -110,6 +110,51 @@ fn split_target_grammar() {
     assert_eq!(super::split_target("corp/"), None);
 }
 
+// ── V-11 target grammar: `[<source>/]<slug>[@<version>]` ────────────────────
+
+#[test]
+fn parse_target_grammar() {
+    use super::Target;
+    assert_eq!(
+        super::parse_target("database@0.1.0"),
+        Target {
+            source: None,
+            slug: "database",
+            version: Some("0.1.0")
+        }
+    );
+    assert_eq!(
+        super::parse_target("corp/database@0.1.0"),
+        Target {
+            source: Some("corp"),
+            slug: "database",
+            version: Some("0.1.0")
+        }
+    );
+    assert_eq!(
+        super::parse_target("database"),
+        Target {
+            source: None,
+            slug: "database",
+            version: None
+        }
+    );
+    assert_eq!(
+        super::parse_target("database"),
+        super::parse_target("database")
+    );
+}
+
+#[test]
+fn parse_target_degenerate_pins_fall_back_to_bare_slug() {
+    let t = super::parse_target("database@");
+    assert_eq!(t.slug, "database@");
+    assert_eq!(t.version, None);
+    let t = super::parse_target("@1.0.0");
+    assert_eq!(t.slug, "@1.0.0");
+    assert_eq!(t.version, None);
+}
+
 #[test]
 fn bare_slug_candidates_origin_first_then_listed_order() {
     let sources = [named("a", true), named("b", true), named("c", true)];
@@ -186,5 +231,51 @@ fn yes_skips_gate_entirely_even_non_interactive() {
     assert!(
         super::confirm_install(&gate_manifest(), true, false).is_ok(),
         "--yes must proceed without a prompt in any run mode"
+    );
+}
+
+// ── V-15 install-target disambiguation ─────────────────────────────────────
+
+#[test]
+fn registry_targets_unchanged_by_archive_mode() {
+    use super::InstallKind;
+    // bare slug still resolves registries
+    assert_eq!(
+        super::classify_install_target("database").unwrap(),
+        InstallKind::Registry
+    );
+    // corp/slug still the registry flow
+    assert_eq!(
+        super::classify_install_target("corp/database@0.1.0").unwrap(),
+        InstallKind::Registry
+    );
+}
+
+#[test]
+fn archive_indicators_route_to_archive_pipeline() {
+    use super::InstallKind;
+    for t in [
+        "https://example.com/x.zip",
+        "http://example.com/x.zip",
+        "./x.zip",
+        "../builds/x.zip",
+        "/abs/path/x.zip",
+        "x.zip",
+    ] {
+        assert_eq!(
+            super::classify_install_target(t).unwrap(),
+            InstallKind::Archive,
+            "{t} must be an archive target"
+        );
+    }
+}
+
+#[test]
+fn version_pin_on_archive_is_a_hard_error() {
+    let err = super::classify_install_target("./x.zip@1.0").unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("archives are not versioned") && msg.contains("./x.zip@1.0"),
+        "unexpected: {msg}"
     );
 }
