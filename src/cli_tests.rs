@@ -84,3 +84,54 @@ async fn verify_with_key_still_works_and_warns() {
     set_signature(&mut cli, Some(good_signature()));
     run(&cli).await.unwrap();
 }
+
+// ── V-09 resolution-engine internals ───────────────────────────────────────
+
+use crate::source::{official_source, RegistrySource};
+
+fn named(name: &str, enabled: bool) -> RegistrySource {
+    RegistrySource {
+        name: name.into(),
+        enabled,
+        ..official_source()
+    }
+}
+
+#[test]
+fn split_target_grammar() {
+    assert_eq!(
+        super::split_target("corp/database"),
+        Some(("corp", "database"))
+    );
+    // bare slugs have no slash
+    assert_eq!(super::split_target("database"), None);
+    // degenerate forms fall back to bare-slug handling
+    assert_eq!(super::split_target("/database"), None);
+    assert_eq!(super::split_target("corp/"), None);
+}
+
+#[test]
+fn bare_slug_candidates_origin_first_then_listed_order() {
+    let sources = [named("a", true), named("b", true), named("c", true)];
+    let out = super::bare_slug_candidates(&sources, Some("c"));
+    let names: Vec<&str> = out.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["c", "a", "b"],
+        "origin leads, listed order follows"
+    );
+}
+
+#[test]
+fn bare_slug_candidates_skips_disabled_and_unknown_origins() {
+    let sources = [named("a", true), named("b", false), named("c", true)];
+    let out = super::bare_slug_candidates(&sources, Some("b"));
+    assert!(
+        out.iter().all(|s| s.name != "b"),
+        "disabled origin must not be probed"
+    );
+
+    let out = super::bare_slug_candidates(&sources, Some("gone"));
+    let names: Vec<&str> = out.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, vec!["a", "c"], "unconfigured origin falls through");
+}
