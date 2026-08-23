@@ -380,12 +380,12 @@ pub async fn run(cli: &Cli) -> Result<(), VynmError> {
     let ctx = Ctx::load(&cli.config)?;
     match &cli.command {
         Command::Install { slug, source } => {
-            let src = ctx.resolve_source(source.as_deref())?;
-            install_cmd(&ctx, &src, slug).await
+            let pinned = pin_source(&ctx, source.as_deref(), slug)?;
+            install_cmd(&ctx, pinned.as_ref(), slug).await.map(|_| ())
         }
         Command::Search { query, source } => {
-            let src = ctx.resolve_source(source.as_deref())?;
-            search_cmd(&ctx, &src, query).await
+            let pinned = pin_source(&ctx, source.as_deref(), query)?;
+            search_cmd(&ctx, pinned.as_ref(), query).await.map(|_| ())
         }
         Command::List { .. } => list_cmd(&ctx),
         Command::Remove { slug } => remove_cmd(&ctx, slug),
@@ -396,12 +396,143 @@ pub async fn run(cli: &Cli) -> Result<(), VynmError> {
     }
 }
 
-async fn install_cmd(ctx: &Ctx, src: &RegistrySource, target: &str) -> Result<(), VynmError> {
-    let entries: Vec<RegistryEntry> = fetch_registry(src, false, &ctx.tmp_dir).await?;
+// ── §7.2 resolution engine (V-09) ───────────────────────────────────────────
+
+/// Which source a target resolved against, so commands can attribute it
+/// (`resolved from <name>`) and tests can assert attribution without
+/// scraping stdout.
+pub struct ResolutionReceipt {
+    pub source_name: String,
+}
+
+/// §7.2 target grammar: `corp/database` → Some(("corp", "database")). Slugs
+/// never contain '/' (MA-17 charset), so the first slash is always the split;
+/// anything else is a bare slug.
+fn split_target(target: &str) -> Option<(&str, &str)> {
+    match target.split_once('/') {
+        Some((name, slug)) if !name.is_empty() && !slug.is_empty() => Some((name, slug)),
+        _ => None,
+    }
+}
+
+/// (--source flag, target) → explicitly pinned source, or None = generic
+/// bare-slug resolution. Explicit forms never search: an unknown name errors
+/// listing every configured source.
+fn pin_source(
+    ctx: &Ctx,
+    flag: Option<&str>,
+    target: &str,
+) -> Result<Option<RegistrySource>, VynmError> {
+    if let Some(name) = flag {
+        return Ok(Some(ctx.resolve_source(Some(name))?));
+    }
+    match split_target(target) {
+        Some((name, _)) => Ok(Some(ctx.resolve_source(Some(name))?)),
+        None => Ok(None),
+    }
+}
+
+/// Bare-slug probe order: enabled sources in listed order, except that a
+/// ledger-recorded origin (§6.2) goes first — reinstalls/updates of an
+/// installed plugin must hit the same channel it came from before generic
+/// search can shadow it. A disabled or since-unconfigured origin falls out.
+fn bare_slug_candidates(
+    sources: &[RegistrySource],
+    ledger_origin: Option<&str>,
+) -> Vec<RegistrySource> {
+    let mut out = Vec::new();
+    if let Some(origin) = ledger_origin {
+        if let Some(s) = sources.iter().find(|s| s.name == origin && s.enabled) {
+            out.push(s.clone());
+        }
+    }
+    for s in sources {
+        if s.enabled && !out.iter().any(|o| o.name == s.name) {
+            out.push(s.clone());
+        }
+    }
+    out
+}
+
+enum ProbeOutcome {
+    Found(RegistrySource, Vec<RegistryEntry>),
+    NoMatch(Vec<String>),
+}
+
+/// Try candidates in order; the first source whose entries satisfy `wants`
+/// wins. A fetch error skips to the next source (warned); when NO candidate
+/// could be fetched at all, the last error propagates unchanged so exit-code
+/// mapping (network=2 etc.) survives multi-source probing.
+async fn probe_sources(
+    candidates: &[RegistrySource],
+    tmp_dir: &Path,
+    wants: impl Fn(&[RegistryEntry]) -> bool,
+) -> Result<ProbeOutcome, VynmError> {
+    let mut last_err = None;
+    let mut fetched_any = false;
+    for src in candidates {
+        match fetch_registry(src, false, tmp_dir).await {
+            Ok(entries) => {
+                fetched_any = true;
+                if wants(&entries) {
+                    return Ok(ProbeOutcome::Found(src.clone(), entries));
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "registry '{}': fetch failed ({e}) — moving to the next source",
+                    src.name
+                );
+                last_err = Some(e);
+            }
+        }
+    }
+    if !fetched_any {
+        return Err(last_err
+            .unwrap_or_else(|| VynmError::Internal("no registry sources configured".into())));
+    }
+    Ok(ProbeOutcome::NoMatch(
+        candidates.iter().map(|s| s.name.clone()).collect(),
+    ))
+}
+
+async fn install_cmd(
+    ctx: &Ctx,
+    pinned: Option<&RegistrySource>,
+    target: &str,
+) -> Result<ResolutionReceipt, VynmError> {
+    let slug = split_target(target).map(|(_, s)| s).unwrap_or(target);
+    let (src, entries) = match pinned {
+        Some(src) => {
+            let entries = fetch_registry(src, false, &ctx.tmp_dir).await?;
+            (src.clone(), entries)
+        }
+        None => {
+            let ledger = load_state(&ctx.tmp_dir);
+            let origin = ledger.get(slug).map(|e| e.source.as_str());
+            let candidates = bare_slug_candidates(&ctx.sources, origin);
+            match probe_sources(&candidates, &ctx.tmp_dir, |entries| {
+                entries.iter().any(|e| e.slug == slug || e.id == slug)
+            })
+            .await?
+            {
+                ProbeOutcome::Found(src, entries) => (src, entries),
+                ProbeOutcome::NoMatch(tried) => {
+                    return Err(VynmError::Internal(format!(
+                        "Plugin '{slug}' not found in any configured source (tried: {}). \
+                         Run 'vynm search {slug}' to browse.",
+                        tried.join(", ")
+                    )));
+                }
+            }
+        }
+    };
+
+    println!("resolved from {}", src.name);
     let installed = install(
         &entries,
-        target,
-        src,
+        slug,
+        &src,
         &ctx.tmp_dir,
         MAX_ARCHIVE_BYTES,
         MAX_EXTRACTED_BYTES,
@@ -431,32 +562,77 @@ async fn install_cmd(ctx: &Ctx, src: &RegistrySource, target: &str) -> Result<()
                 .display()
         ),
     }
-    Ok(())
+    Ok(ResolutionReceipt {
+        source_name: src.name,
+    })
 }
 
-async fn search_cmd(ctx: &Ctx, src: &RegistrySource, query: &str) -> Result<(), VynmError> {
-    let entries: Vec<RegistryEntry> = fetch_registry(src, false, &ctx.tmp_dir).await?;
-
-    let q = query.to_ascii_lowercase();
-    let mut hits: Vec<&RegistryEntry> = entries
+/// search hits for a lowercased query — shared by the probe predicate and
+/// the table printer so both see exactly the same matches (owned clones: the
+/// probe's registry document doesn't outlive resolution)
+fn matching_entries(entries: &[RegistryEntry], q: &str) -> Vec<RegistryEntry> {
+    let mut hits: Vec<RegistryEntry> = entries
         .iter()
         .filter(|e| {
-            e.slug.to_ascii_lowercase().contains(&q)
-                || e.name.to_ascii_lowercase().contains(&q)
-                || e.description.to_ascii_lowercase().contains(&q)
+            e.slug.to_ascii_lowercase().contains(q)
+                || e.name.to_ascii_lowercase().contains(q)
+                || e.description.to_ascii_lowercase().contains(q)
         })
+        .cloned()
         .collect();
     hits.sort_by(|a, b| a.slug.cmp(&b.slug));
-    if hits.is_empty() {
-        println!("no matches for '{query}'");
-        return Ok(());
-    }
+    hits
+}
+
+/// `None` = nothing matched anywhere — still exit 0, like single-source era.
+async fn search_cmd(
+    ctx: &Ctx,
+    pinned: Option<&RegistrySource>,
+    query: &str,
+) -> Result<Option<ResolutionReceipt>, VynmError> {
+    let q = query.to_ascii_lowercase();
+    let wants = |entries: &[RegistryEntry]| !matching_entries(entries, &q).is_empty();
+
+    let (source_name, hits): (String, Vec<RegistryEntry>) = match pinned {
+        Some(src) => {
+            let entries = fetch_registry(src, false, &ctx.tmp_dir).await?;
+            let hits = matching_entries(&entries, &q);
+            if hits.is_empty() {
+                println!("no matches for '{query}'");
+                return Ok(None);
+            }
+            (src.name.clone(), hits)
+        }
+        None => {
+            // bare query: ledger-origin lookup only fires when the query is
+            // verbatim a slug; otherwise plain listed order applies
+            let ledger = load_state(&ctx.tmp_dir);
+            let origin = ledger.get(query).map(|e| e.source.as_str());
+            let candidates = bare_slug_candidates(&ctx.sources, origin);
+            match probe_sources(&candidates, &ctx.tmp_dir, wants).await? {
+                ProbeOutcome::Found(src, entries) => {
+                    let hits = matching_entries(&entries, &q);
+                    if hits.is_empty() {
+                        println!("no matches for '{query}'");
+                        return Ok(None);
+                    }
+                    (src.name.clone(), hits)
+                }
+                ProbeOutcome::NoMatch(_) => {
+                    println!("no matches for '{query}'");
+                    return Ok(None);
+                }
+            }
+        }
+    };
+
+    println!("resolved from {source_name}");
     println!("{:<24} {:<10} {:<10} NAME", "SLUG", "VERSION", "STATUS");
     for e in hits {
         let status = if e.is_revoked() { "revoked" } else { &e.status };
         println!("{:<24} {:<10} {:<10} {}", e.slug, e.version, status, e.name);
     }
-    Ok(())
+    Ok(Some(ResolutionReceipt { source_name }))
 }
 
 fn list_cmd(ctx: &Ctx) -> Result<(), VynmError> {
