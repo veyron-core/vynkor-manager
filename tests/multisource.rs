@@ -44,7 +44,7 @@ fn build_archive(slug: &str, version: &str) -> (Vec<u8>, String) {
     (bytes.clone(), hex(&Sha256::digest(&bytes)))
 }
 
-// archive_url stays root-relative ("/database.zip") — resolved against each
+// archive_url stays root-relative ("/<slug>.zip") — resolved against each
 // registry's own base at install time, so one entry body works for any
 // server. (An empty string would resolve to the registry URL itself.)
 fn unsigned_entry(slug: &str, version: &str, sha256: &str) -> RegistryEntry {
@@ -55,7 +55,7 @@ fn unsigned_entry(slug: &str, version: &str, sha256: &str) -> RegistryEntry {
         description: format!("the {slug} plugin"),
         version: version.into(),
         permissions: vec![],
-        archive_url: "/database.zip".into(),
+        archive_url: format!("/{slug}.zip"),
         source_url: String::new(),
         sha256: sha256.into(),
         min_kernel_version: "0.1.0".into(),
@@ -82,9 +82,9 @@ async fn serve(body: Vec<(&str, &str, &str)>) -> (mockito::ServerGuard, String) 
     (server, url)
 }
 
-async fn serve_archive(server: &mut mockito::ServerGuard, bytes: Vec<u8>) {
+async fn serve_archive_at(server: &mut mockito::ServerGuard, path: &str, bytes: Vec<u8>) {
     server
-        .mock("GET", "/database.zip")
+        .mock("GET", path)
         .with_status(200)
         .with_body(bytes)
         .create_async()
@@ -192,8 +192,8 @@ async fn bare_slug_shadowing_picks_first_listed_and_prints_attribution() {
     let (b, hash_b) = build_archive("database", "2.0.0");
     let (mut sa, url_a) = serve(vec![("database", "1.0.0", &hash_a)]).await;
     let (mut s2, url_b) = serve(vec![("database", "2.0.0", &hash_b)]).await;
-    serve_archive(&mut sa, a).await;
-    serve_archive(&mut s2, b).await;
+    serve_archive_at(&mut sa, "/database.zip", a).await;
+    serve_archive_at(&mut s2, "/database.zip", b).await;
 
     let cfg = sb.config(&sources_yaml(&[
         ("first", &url_a, true, true),
@@ -227,8 +227,8 @@ async fn explicit_form_bypasses_search_even_when_shadowed() {
     let (b, hash_b) = build_archive("database", "2.0.0");
     let (mut sa, url_a) = serve(vec![("database", "1.0.0", &hash_a)]).await;
     let (mut s2, url_b) = serve(vec![("database", "2.0.0", &hash_b)]).await;
-    serve_archive(&mut sa, a).await;
-    serve_archive(&mut s2, b).await;
+    serve_archive_at(&mut sa, "/database.zip", a).await;
+    serve_archive_at(&mut s2, "/database.zip", b).await;
 
     let _cfg = sb.config(&sources_yaml(&[
         ("first", &url_a, true, true),
@@ -293,8 +293,8 @@ async fn ledger_origin_resolves_against_recorded_source_first() {
     let (b, hash_b) = build_archive("database", "2.0.0");
     let (mut sa, url_a) = serve(vec![("database", "1.0.0", &hash_a)]).await;
     let (mut s2, url_b) = serve(vec![("database", "2.0.0", &hash_b)]).await;
-    serve_archive(&mut sa, a).await;
-    serve_archive(&mut s2, b).await;
+    serve_archive_at(&mut sa, "/database.zip", a).await;
+    serve_archive_at(&mut s2, "/database.zip", b).await;
 
     let _cfg = sb.config(&sources_yaml(&[
         ("first", &url_a, true, true),
@@ -335,7 +335,7 @@ async fn probe_skips_unreachable_source() {
     let sb = Sandbox::new();
     let (a, hash_a) = build_archive("database", "1.0.0");
     let (mut s2, url_b) = serve(vec![("database", "1.0.0", &hash_a)]).await;
-    serve_archive(&mut s2, a).await;
+    serve_archive_at(&mut s2, "/database.zip", a).await;
 
     let _cfg = sb.config(&sources_yaml(&[
         ("dead", dead_url(), true, true),
@@ -376,8 +376,8 @@ async fn allow_unsigned_is_per_source_during_probe() {
     let (a, hash_a) = build_archive("database", "1.0.0");
     let (mut s1, url_a) = serve(vec![("database", "1.0.0", &hash_a)]).await;
     let (mut s2, url_b) = serve(vec![("database", "1.0.0", &hash_a)]).await;
-    serve_archive(&mut s1, a.clone()).await;
-    serve_archive(&mut s2, a).await;
+    serve_archive_at(&mut s1, "/database.zip", a.clone()).await;
+    serve_archive_at(&mut s2, "/database.zip", a).await;
 
     // listed order: corp has NO consent → its probe fails; open consents
     let _cfg = sb.config(&sources_yaml(&[
@@ -400,8 +400,8 @@ async fn disabled_sources_are_skipped_in_generic_order() {
     // s1 backs `on` (v1.0.0), s2 backs `off` (v2.0.0)
     let (mut s1, url_on) = serve(vec![("database", "1.0.0", &hash_a)]).await;
     let (mut s2, url_off) = serve(vec![("database", "2.0.0", &_hash_b)]).await;
-    serve_archive(&mut s1, a.clone()).await;
-    serve_archive(&mut s2, b).await;
+    serve_archive_at(&mut s1, "/database.zip", a.clone()).await;
+    serve_archive_at(&mut s2, "/database.zip", b).await;
 
     let _cfg = sb.config(&sources_yaml(&[
         ("off", &url_off, true, false),
@@ -476,4 +476,90 @@ async fn search_with_source_flag_pins_one_registry() {
         "wrong source pinned: {output}"
     );
     drop((s1, s2));
+}
+
+// ── list --source: filter rows by ledger origin, validate the name ─────────
+
+#[tokio::test]
+async fn list_filters_by_source_flag_and_validates_name() {
+    let sb = Sandbox::new();
+    // first: database@1.0.0 + logger; second: database@2.0.0
+    let (db1, hash_db1) = build_archive("database", "1.0.0");
+    let (lg, hash_lg) = build_archive("logger", "1.0.0");
+    let (db2, hash_db2) = build_archive("database", "2.0.0");
+    let (mut s1, url_a) = serve(vec![
+        ("database", "1.0.0", &hash_db1),
+        ("logger", "1.0.0", &hash_lg),
+    ])
+    .await;
+    let (mut s2, url_b) = serve(vec![("database", "2.0.0", &hash_db2)]).await;
+    serve_archive_at(&mut s1, "/database.zip", db1).await;
+    serve_archive_at(&mut s1, "/logger.zip", lg).await;
+    serve_archive_at(&mut s2, "/database.zip", db2).await;
+
+    let cfg = sb.config(&sources_yaml(&[
+        ("first", &url_a, true, true),
+        ("second", &url_b, true, true),
+    ]));
+    let state_dir = sb.dir.path().to_path_buf();
+    let plugin_dir = sb.dir.path().join("plugins");
+
+    sb.run(&["install", "logger"]).await.unwrap(); // bare → first
+    sb.run(&["install", "second/database"]).await.unwrap();
+
+    let (ok, out) = vynm(&cfg, &state_dir, &plugin_dir, &["list"]);
+    assert!(ok);
+    assert!(out.contains("logger") && out.contains("first"));
+    assert!(out.contains("database") && out.contains("second"));
+
+    let (ok, out) = vynm(
+        &cfg,
+        &state_dir,
+        &plugin_dir,
+        &["list", "--source", "first"],
+    );
+    assert!(ok);
+    assert!(out.contains("logger"), "row missing: {out}");
+    assert!(!out.contains("database"), "filter leaked: {out}");
+
+    let (ok, out) = vynm(
+        &cfg,
+        &state_dir,
+        &plugin_dir,
+        &["list", "--source", "second"],
+    );
+    assert!(ok);
+    assert!(out.contains("database"), "row missing: {out}");
+    assert!(!out.contains("logger"), "filter leaked: {out}");
+
+    // unknown name → the configured-sources listing error, even mid-flight
+    let err = sb.run(&["list", "--source", "nope"]).await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("configured sources: first, second"),
+        "unexpected: {err}"
+    );
+    drop((s1, s2));
+}
+
+#[tokio::test]
+async fn list_from_empty_source_prints_friendly_line() {
+    let sb = Sandbox::new();
+    let (_, hash_a) = build_archive("database", "1.0.0");
+    let (s1, url_a) = serve(vec![("database", "1.0.0", &hash_a)]).await;
+
+    let cfg = sb.config(&sources_yaml(&[("first", &url_a, true, true)]));
+
+    let (ok, out) = vynm(
+        &cfg,
+        sb.dir.path(),
+        &sb.dir.path().join("plugins"),
+        &["list", "--source", "first"],
+    );
+    assert!(ok);
+    assert!(
+        out.contains("no plugins installed from 'first'"),
+        "unexpected: {out}"
+    );
+    drop(s1);
 }
