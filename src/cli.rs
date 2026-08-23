@@ -19,7 +19,6 @@ use crate::installer::{format_permission_preview, install};
 use crate::registry::{fetch_registry, RegistryEntry};
 use crate::source::{official_source, RegistrySource};
 use crate::state::{format_ts, load_state};
-
 // ── exit codes — the scripting contract (0 ok / 1 failure / 2 network /
 // 3 verification; finalized in V-16) ─────────────────────────────────────────
 
@@ -412,13 +411,41 @@ pub struct ResolutionReceipt {
     pub source_name: String,
 }
 
-/// §7.2 target grammar: `corp/database` → Some(("corp", "database")). Slugs
-/// never contain '/' (MA-17 charset), so the first slash is always the split;
-/// anything else is a bare slug.
+/// §7.2 target grammar (V-11): `[<source>/]<slug>[@<version>]`. Slugs never
+/// contain '/' (MA-17 charset) nor '@', so the first slash is the source
+/// split and the first '@' is the version pin; anything else is a bare slug.
 fn split_target(target: &str) -> Option<(&str, &str)> {
     match target.split_once('/') {
         Some((name, slug)) if !name.is_empty() && !slug.is_empty() => Some((name, slug)),
         _ => None,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct Target<'a> {
+    /// named source (`corp/slug`), or None = generic resolution
+    source: Option<&'a str>,
+    slug: &'a str,
+    /// exact-version pin (`slug@0.1.0`, V-11)
+    version: Option<&'a str>,
+}
+
+fn parse_target(target: &str) -> Target<'_> {
+    // split the pin off first so `corp/database@0.1.0` splits on the slash
+    // that precedes the '@' — an empty head/version leaves the target whole,
+    // which then fails downstream matching like any unknown slug.
+    let (head, version) = match target.split_once('@') {
+        Some((h, v)) if !h.is_empty() && !v.is_empty() => (h, Some(v)),
+        _ => (target, None),
+    };
+    let (source, slug) = match split_target(head) {
+        Some((s, sl)) => (Some(s), sl),
+        None => (None, head),
+    };
+    Target {
+        source,
+        slug,
+        version,
     }
 }
 
@@ -433,8 +460,8 @@ fn pin_source(
     if let Some(name) = flag {
         return Ok(Some(ctx.resolve_source(Some(name))?));
     }
-    match split_target(target) {
-        Some((name, _)) => Ok(Some(ctx.resolve_source(Some(name))?)),
+    match parse_target(target).source {
+        Some(name) => Ok(Some(ctx.resolve_source(Some(name))?)),
         None => Ok(None),
     }
 }
@@ -559,17 +586,15 @@ fn confirm_install(
     }
 }
 
-async fn install_cmd(
+async fn resolve_unpinned(
     ctx: &Ctx,
     pinned: Option<&RegistrySource>,
-    target: &str,
-    yes: bool,
-) -> Result<ResolutionReceipt, VynmError> {
-    let slug = split_target(target).map(|(_, s)| s).unwrap_or(target);
-    let (src, entries) = match pinned {
+    slug: &str,
+) -> Result<(RegistrySource, Vec<RegistryEntry>), VynmError> {
+    match pinned {
         Some(src) => {
             let entries = fetch_registry(src, false, &ctx.tmp_dir).await?;
-            (src.clone(), entries)
+            Ok((src.clone(), entries))
         }
         None => {
             let ledger = load_state(&ctx.tmp_dir);
@@ -580,16 +605,103 @@ async fn install_cmd(
             })
             .await?
             {
-                ProbeOutcome::Found(src, entries) => (src, entries),
-                ProbeOutcome::NoMatch(tried) => {
-                    return Err(VynmError::Internal(format!(
-                        "Plugin '{slug}' not found in any configured source (tried: {}). \
-                         Run 'vynm search {slug}' to browse.",
-                        tried.join(", ")
-                    )));
-                }
+                ProbeOutcome::Found(src, entries) => Ok((src, entries)),
+                ProbeOutcome::NoMatch(tried) => Err(VynmError::Internal(format!(
+                    "Plugin '{slug}' not found in any configured source (tried: {}). \
+                     Run 'vynm search {slug}' to browse.",
+                    tried.join(", ")
+                ))),
             }
         }
+    }
+}
+
+/// V-11 — exact-version resolution: candidates in bare-slug order (or the
+/// single explicitly pinned source), each fetched and filtered to
+/// `slug AND version == pin`. First source serving the exact version wins;
+/// a miss errors listing what each tried source DOES serve for the slug.
+async fn resolve_pinned(
+    ctx: &Ctx,
+    pinned: Option<&RegistrySource>,
+    slug: &str,
+    version: &str,
+) -> Result<(RegistrySource, Vec<RegistryEntry>), VynmError> {
+    let candidates: Vec<RegistrySource> = match pinned {
+        Some(src) => vec![src.clone()],
+        None => {
+            let ledger = load_state(&ctx.tmp_dir);
+            let origin = ledger.get(slug).map(|e| e.source.as_str());
+            bare_slug_candidates(&ctx.sources, origin)
+        }
+    };
+    // (source name, versions it serves) → the miss report
+    let mut serves: Vec<(String, Vec<String>)> = Vec::new();
+    let mut fetched_any = false;
+    let mut last_err = None;
+    for src in &candidates {
+        match fetch_registry(src, false, &ctx.tmp_dir).await {
+            Ok(entries) => {
+                fetched_any = true;
+                let mut versions: Vec<String> = entries
+                    .iter()
+                    .filter(|e| e.slug == slug || e.id == slug)
+                    .map(|e| e.version.clone())
+                    .collect();
+                versions.sort();
+                versions.dedup();
+                if let Some(hit) = entries
+                    .iter()
+                    .find(|e| (e.slug == slug || e.id == slug) && e.version == version)
+                {
+                    // hand install() ONLY the pinned entry — its internal
+                    // find takes the first slug match, so a multi-version
+                    // document must not let an unpinned version win
+                    return Ok((src.clone(), vec![hit.clone()]));
+                }
+                serves.push((src.name.clone(), versions));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "registry '{}': fetch failed ({e}) — moving to the next source",
+                    src.name
+                );
+                last_err = Some(e);
+            }
+        }
+    }
+    if !fetched_any {
+        return Err(last_err
+            .unwrap_or_else(|| VynmError::Internal("no registry sources configured".into())));
+    }
+    let listing = serves
+        .iter()
+        .map(|(name, vs)| {
+            if vs.is_empty() {
+                format!("{slug}: {name} serves nothing")
+            } else {
+                format!("{slug}: {name} serves {}", vs.join(", "))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(VynmError::Internal(format!(
+        "'{slug}@{version}' not found — available: {listing}"
+    )))
+}
+
+async fn install_cmd(
+    ctx: &Ctx,
+    pinned: Option<&RegistrySource>,
+    target: &str,
+    yes: bool,
+) -> Result<ResolutionReceipt, VynmError> {
+    let t = parse_target(target);
+    let slug = t.slug;
+    let (src, entries) = match t.version {
+        // V-11: exact-version pin — same candidate order as bare slugs
+        // (origin first), filtered to the exact version
+        Some(ver) => resolve_pinned(ctx, pinned, slug, ver).await?,
+        None => resolve_unpinned(ctx, pinned, slug).await?,
     };
 
     println!("resolved from {}", src.name);

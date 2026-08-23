@@ -110,6 +110,51 @@ fn split_target_grammar() {
     assert_eq!(super::split_target("corp/"), None);
 }
 
+// ── V-11 target grammar: `[<source>/]<slug>[@<version>]` ────────────────────
+
+#[test]
+fn parse_target_grammar() {
+    use super::Target;
+    assert_eq!(
+        super::parse_target("database@0.1.0"),
+        Target {
+            source: None,
+            slug: "database",
+            version: Some("0.1.0")
+        }
+    );
+    assert_eq!(
+        super::parse_target("corp/database@0.1.0"),
+        Target {
+            source: Some("corp"),
+            slug: "database",
+            version: Some("0.1.0")
+        }
+    );
+    assert_eq!(
+        super::parse_target("database"),
+        Target {
+            source: None,
+            slug: "database",
+            version: None
+        }
+    );
+    assert_eq!(
+        super::parse_target("database"),
+        super::parse_target("database")
+    );
+}
+
+#[test]
+fn parse_target_degenerate_pins_fall_back_to_bare_slug() {
+    let t = super::parse_target("database@");
+    assert_eq!(t.slug, "database@");
+    assert_eq!(t.version, None);
+    let t = super::parse_target("@1.0.0");
+    assert_eq!(t.slug, "@1.0.0");
+    assert_eq!(t.version, None);
+}
+
 #[test]
 fn bare_slug_candidates_origin_first_then_listed_order() {
     let sources = [named("a", true), named("b", true), named("c", true)];
