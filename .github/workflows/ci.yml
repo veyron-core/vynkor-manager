@@ -21,6 +21,11 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      # vynkor-wire 0.0.2 runs prost-build codegen in its build script,
+      # which needs protoc present at compile time
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
