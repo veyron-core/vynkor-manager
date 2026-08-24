@@ -13,12 +13,13 @@
 pub fn official_source() -> RegistrySource {
     RegistrySource {
         name: "official".into(),
-        url: "https://raw.githubusercontent.com/vynkor-core/vynkor-plugins/main/registry.json"
-            .into(),
+        // cloudflare r2 mirror while the custom domain is pending; swap to
+        // https://plugins.<domain>/registry.json once connected
+        url: "https://pub-6fd4e146631e43028372c95cbd2b9b42.r2.dev/registry.json".into(),
         public_key: Some(
             // offline maintainer key; rotate = re-sign entries + ship a new
             // default here. Private half never touches any repo.
-            "ed8c39a19dcbfed1a3a436b914a8ce9bf2b449c534808ce92c78adcfa2590928".into(),
+            "6ee352d706eaf5b5114a1252fb76bb8a2bfbf177b0e4c8e9c21f73b9019083ee".into(),
         ),
         allow_unsigned: false,
         cache_ttl_secs: 3600,
