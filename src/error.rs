@@ -13,6 +13,11 @@ pub enum VynmError {
     Internal(String),
     #[error("cache error: {0}")]
     Cache(String),
+    /// Security-refusal class (signature/digest/revocation/zip-slip/tampering):
+    /// `cli::exit_code` maps this variant to 3 by type — never reintroduce
+    /// message-sniffing for exit codes.
+    #[error("{0}")]
+    Verification(String),
     #[error("plugin not found: {0}")]
     PluginNotFound(String),
     #[error("network error: {0}")]

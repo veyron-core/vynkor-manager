@@ -300,9 +300,38 @@ fn kind_label(row: &Row) -> String {
     }
 }
 
+#[derive(serde::Serialize)]
+struct OutdatedRowJson<'a> {
+    slug: &'a str,
+    installed_version: &'a str,
+    available_version: Option<&'a str>,
+    source: &'a str,
+    status: String,
+}
+
+/// Pure so the `--json` shape (V-16) is unit-testable without a survey run.
+fn render_outdated_json(rows: &[Row]) -> String {
+    let doc: Vec<OutdatedRowJson<'_>> = rows
+        .iter()
+        .map(|row| OutdatedRowJson {
+            slug: &row.slug,
+            installed_version: &row.installed_version,
+            available_version: row.available_version.as_deref(),
+            source: &row.source_name,
+            status: kind_label(row),
+        })
+        .collect();
+    serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "[]".into())
+}
+
 /// `vynm outdated` — report-only over ALL ledger entries, exit 0 always.
-pub async fn outdated_cmd(ctx: &Ctx) -> Result<(), VynmError> {
+pub async fn outdated_cmd(ctx: &Ctx, json: bool) -> Result<(), VynmError> {
     let survey = survey(ctx, None).await?;
+
+    if json {
+        println!("{}", render_outdated_json(&survey.rows));
+        return Ok(());
+    }
 
     println!(
         "{:<24} {:<12} {:<12} {:<14} STATUS",
@@ -379,13 +408,14 @@ fn read_yes_from_stdin() -> bool {
     std::io::stdin().read_line(&mut line).is_ok() && line.trim().eq_ignore_ascii_case("y")
 }
 
-/// `vynm update [slug] [--force] [-y]`. `ask` is injected for tests (prompt
-/// counting); prod passes [`read_yes_from_stdin`].
+/// `vynm update [slug] [--force] [-y] [--dry-run]`. `ask` is injected for
+/// tests (prompt counting); prod passes [`read_yes_from_stdin`].
 pub async fn update_cmd_with_ask(
     ctx: &Ctx,
     scope: Option<&str>,
     force: bool,
     yes: bool,
+    dry_run: bool,
     interactive: bool,
     mut ask: impl FnMut() -> bool,
 ) -> Result<(), VynmError> {
@@ -425,6 +455,11 @@ pub async fn update_cmd_with_ask(
             row.available_version.as_deref().unwrap_or("?"),
             row.source_name,
         );
+    }
+
+    if dry_run {
+        println!("dry run: nothing applied");
+        return Ok(());
     }
 
     match confirm_mode(yes, interactive) {
@@ -546,12 +581,14 @@ pub async fn update_cmd(
     scope: Option<&str>,
     force: bool,
     yes: bool,
+    dry_run: bool,
 ) -> Result<(), VynmError> {
     update_cmd_with_ask(
         ctx,
         scope,
         force,
         yes,
+        dry_run,
         std::io::stdin().is_terminal(),
         read_yes_from_stdin,
     )

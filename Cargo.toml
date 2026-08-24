@@ -1,6 +1,6 @@
 [package]
 name = "vynkor-manager"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.85.0"
 description = "vynm — plugin marketplace manager for Veyron/vynkor: install, update, and manage kernel plugins from registries."
@@ -34,6 +34,8 @@ vynkor-wire = { version = "0.0.2", features = ["manifest"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 indicatif = "0.18"
 clap = { version = "4", features = ["derive"] }
+# V-16 shell-completion generation (bash/zsh/fish) from the clap surface
+clap_complete = "4"
 serde_yaml = "0.9"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 

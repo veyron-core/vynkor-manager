@@ -31,8 +31,46 @@ The kernel has no runtime awareness of vynm — drop-ins are just files.
 
 ## CLI
 
-The `vynm` command surface (`install/search/list/remove/enable/disable`) lands
-in V-06; the current build is a scaffold binary.
+`vynm` manages plugins across one or more configured registry sources:
+
+```text
+vynm install <target> [--source N] [-y] [--allow-unsigned] [--dry-run]
+vynm search <query> [--source N] [--json]
+vynm info <target> [--source N] [--json]
+vynm list [--source N] [--json]
+vynm outdated [--json]
+vynm update [slug] [--force] [-y] [--dry-run]
+vynm verify [slug]
+vynm remove|enable|disable <slug>
+vynm cache clean
+vynm keygen|sign|new          # maintainer tooling (V-14/V-20)
+vynm completions <bash|zsh|fish>
+```
+
+`<target>` is `[<source>/]<slug>[@<version>]`. Archives bypass registries:
+a path (`./x.zip`) or direct URL installs without a signature/sha256-channel
+guarantee (V-15). `--dry-run` resolves and prints the plan (permissions
+included) but writes nothing.
+
+### Exit codes — scripting contract (V-16)
+
+The mapping is type-based, not message-based: security refusals carry the
+`Verification` error class internally. This table is stable API for scripts:
+
+| Code | Meaning |
+|---|---|
+| `0` | success |
+| `1` | generic failure (bad input, missing plugin, manifest invalid, …) |
+| `2` | network error (registry fetch/download failed) |
+| `3` | verification failure — signature mismatch, digest mismatch,
+  revoked entry, malformed/zip-slip archive, tampered tree |
+
+### Shell completion
+
+Static scripts: `vynm completions bash > …` (likewise `zsh`, `fish`).
+Dynamic slug completion is exposed as the hidden command `__complete-slugs`,
+which serves the LOCAL registry caches first (instant, offline) and only
+touches the network when no usable cache exists.
 
 ## Gates
 

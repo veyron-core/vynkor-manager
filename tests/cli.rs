@@ -31,16 +31,31 @@ fn network_errors_map_to_exit_2() {
 
 #[test]
 fn verification_failures_map_to_exit_3() {
-    // canonical wording carried by the ported security refusals
+    // class carried by the Verification VARIANT (V-16), not message-sniffing;
+    // these are the canonical raise-site texts
     for msg in [
         "Plugin 'x' failed signature verification — ...",
         "Archive integrity check failed. Expected a, got b.",
         "Plugin 'x' v1 is revoked by the maintainer. Aborting — do not install.",
         "Malformed archive: decompressed size exceeds max 1 bytes. Aborting.",
         "Malformed archive: path traversal detected in entry '../a'. Aborting.",
+        "integrity check failed: 2 of 3 installed trees tampered",
+    ] {
+        let e = VynmError::Verification(msg.into());
+        assert_eq!(exit_code(&e), EXIT_VERIFICATION, "msg: {msg}");
+    }
+}
+
+#[test]
+fn internal_failures_stay_exit_1() {
+    // manifest-validation and corrupt-zip refusals were never part of the
+    // verification class (old sniffing mapped them to 1) — that is preserved.
+    for msg in [
+        "manifest: missing field `plugin_id`",
+        "open zip: invalid archive",
     ] {
         let e = VynmError::Internal(msg.into());
-        assert_eq!(exit_code(&e), EXIT_VERIFICATION, "msg: {msg}");
+        assert_eq!(exit_code(&e), EXIT_FAILURE, "msg: {msg}");
     }
 }
 
@@ -369,4 +384,51 @@ fn resolve_source_matches_any_configured_name() {
         msg.contains("configured sources: official, corp"),
         "unexpected: {msg}"
     );
+}
+
+// ── V-16: cache clean ───────────────────────────────────────────────────────
+
+#[test]
+fn cache_clean_removes_every_cached_document_but_not_the_ledger() {
+    let _guard = env_guard();
+    let tmp = tempdir().unwrap();
+    std::env::set_var("VYNM_STATE_DIR", tmp.path());
+
+    let cache_dir = tmp.path().join("registry-cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    fs::write(cache_dir.join("official.json"), "{\"schema_version\":2}").unwrap();
+    fs::write(cache_dir.join("corp.json"), "{}").unwrap();
+    // ledger lives NEXT to the cache dir — must survive the clean
+    fs::write(tmp.path().join("installed.json"), "{\"entries\":[]}").unwrap();
+
+    // sync test + block_on so the env-guard Mutex never spans an await point
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    // /nonexistent.yaml is fine: no config file → pure defaults; command is local
+    let args = ["vynm", "--config", "/nonexistent.yaml", "cache", "clean"];
+    rt.block_on(vynkor_manager::cli::run(&clap_parse(args)))
+        .unwrap();
+
+    assert!(!cache_dir.exists(), "cache dir must be gone after clean");
+    assert!(
+        tmp.path().join("installed.json").exists(),
+        "ledger untouched"
+    );
+
+    // second run on a missing dir reports empty instead of erroring
+    rt.block_on(vynkor_manager::cli::run(&clap_parse(args)))
+        .unwrap();
+
+    std::env::remove_var("VYNM_STATE_DIR");
+}
+
+fn clap_parse<I, S>(args: I) -> vynkor_manager::cli::Cli
+where
+    I: IntoIterator<Item = S>,
+    S: Into<std::ffi::OsString> + Clone,
+{
+    use clap::Parser as _;
+    vynkor_manager::cli::Cli::parse_from(args)
 }

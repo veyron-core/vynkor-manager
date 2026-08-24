@@ -361,7 +361,7 @@ async fn one_confirmation_for_the_whole_batch() {
     // drive update_cmd_with_ask directly to COUNT the ask invocations
     {
         let ctx = vynkor_manager::cli::Ctx::load(&_cfg).unwrap();
-        vynkor_manager::update::update_cmd_with_ask(&ctx, None, false, false, true, || {
+        vynkor_manager::update::update_cmd_with_ask(&ctx, None, false, false, false, true, || {
             prompts += 1;
             true
         })

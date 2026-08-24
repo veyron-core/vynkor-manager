@@ -163,13 +163,13 @@ pub fn verify_entry_signature(
         .map_err(|e| VynmError::Internal(format!("invalid marketplace public key: {e}")))?;
 
     let sig_bytes = hex_decode(&entry.signature).map_err(|_| {
-        VynmError::Internal(format!(
+        VynmError::Verification(format!(
             "Plugin '{}' has a malformed signature. Aborting — do not proceed.",
             entry.slug
         ))
     })?;
     let sig_bytes: [u8; 64] = sig_bytes.try_into().map_err(|_| {
-        VynmError::Internal(format!(
+        VynmError::Verification(format!(
             "Plugin '{}' signature must be 64 bytes. Aborting — do not proceed.",
             entry.slug
         ))
@@ -179,7 +179,7 @@ pub fn verify_entry_signature(
     verifying_key
         .verify_strict(signed_message(entry).as_bytes(), &signature)
         .map_err(|_| {
-            VynmError::Internal(format!(
+            VynmError::Verification(format!(
                 "Plugin '{}' failed signature verification — the maintainer signature does not \
                  match the entry (slug/version/sha256/status/archive_url/kernel-compat). \
                  Aborting — do not proceed.",
@@ -197,9 +197,13 @@ pub fn registry_cache_path(tmp_dir: &Path, source: &RegistrySource) -> PathBuf {
     } else {
         url_hash(&source.url)
     };
-    state_dir(tmp_dir)
-        .join("registry-cache")
-        .join(format!("{stem}.json"))
+    registry_cache_dir(tmp_dir).join(format!("{stem}.json"))
+}
+
+/// The per-source cache directory root — V-16 `cache clean` deletes through
+/// this so the layout stays single-sourced in registry.rs.
+pub fn registry_cache_dir(tmp_dir: &Path) -> PathBuf {
+    state_dir(tmp_dir).join("registry-cache")
 }
 
 fn url_hash(url: &str) -> String {
@@ -686,14 +690,48 @@ pub fn resolve_relative_archive_urls(entries: &mut [RegistryEntry], base_url: &s
     }
 }
 
-/// C2: shell-completion slug listing, moved here wholesale from the kernel's
-/// `cli/complete.rs`. CLI wiring lands in V-06.
-pub async fn complete_slugs(source: &RegistrySource, tmp_dir: &Path) -> Result<(), VynmError> {
-    let entries = fetch_registry(source, false, tmp_dir).await?;
-    for e in entries {
-        println!("{}", e.slug);
+/// C2: unique sorted slugs in ONE source's on-disk cache, TTL ignored —
+/// dynamic completion must answer instantly and offline.
+pub fn cached_slugs(path: &Path) -> Vec<String> {
+    let Some(cache) = read_cache_file(path) else {
+        return Vec::new();
+    };
+    let mut slugs: Vec<String> = cache.entries.iter().map(|e| e.slug.clone()).collect();
+    slugs.sort();
+    slugs.dedup();
+    slugs
+}
+
+/// C2 dynamic slug completion, V-16 contract: serve the LOCAL caches of all
+/// `sources` first (instant, offline, TTL-ignored); only when no usable cache
+/// exists anywhere fall through to the network, probing ENABLED sources in
+/// listed order and stopping at the first success. Never errors on fetch
+/// failures alone — an empty answer is better than a broken prompt.
+pub async fn complete_slugs_cached_first(
+    sources: &[RegistrySource],
+    tmp_dir: &Path,
+) -> Result<Vec<String>, VynmError> {
+    let mut all: Vec<String> = Vec::new();
+    for src in sources {
+        all.extend(cached_slugs(&registry_cache_path(tmp_dir, src)));
     }
-    Ok(())
+    all.sort();
+    all.dedup();
+    if !all.is_empty() {
+        return Ok(all);
+    }
+    for src in sources.iter().filter(|s| s.enabled) {
+        match fetch_registry(src, false, tmp_dir).await {
+            Ok(entries) => {
+                let mut slugs: Vec<String> = entries.into_iter().map(|e| e.slug).collect();
+                slugs.sort();
+                slugs.dedup();
+                return Ok(slugs);
+            }
+            Err(e) => tracing::warn!("registry '{}': fetch for completion failed ({e})", src.name),
+        }
+    }
+    Ok(Vec::new())
 }
 
 #[cfg(test)]
