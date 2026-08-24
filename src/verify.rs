@@ -125,9 +125,7 @@ pub fn verify_cmd(tmp_dir: &Path, slug: Option<&str>) -> Result<(), VynmError> {
     println!("{ok} ok, {tampered} tampered, {missing} missing, {unknown} unknown baseline");
 
     if tampered > 0 {
-        // wording is load-bearing: "integrity check failed" maps to the
-        // verification exit code in cli::exit_code
-        Err(VynmError::Internal(format!(
+        Err(VynmError::Verification(format!(
             "integrity check failed: {tampered} of {} installed trees tampered",
             reports.len()
         )))

@@ -34,6 +34,8 @@ vynkor-wire = { version = "0.0.2", features = ["manifest"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 indicatif = "0.18"
 clap = { version = "4", features = ["derive"] }
+# V-16 shell-completion generation (bash/zsh/fish) from the clap surface
+clap_complete = "4"
 serde_yaml = "0.9"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 

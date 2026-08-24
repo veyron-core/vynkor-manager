@@ -3,6 +3,7 @@
 //! user-facing contract: subcommands take `--source <name>` from day one
 //! (§6.5 — adding sources later changes resolution logic, never grammar).
 
+use std::fs;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
@@ -19,30 +20,20 @@ use crate::installer::{format_permission_preview, install, install_archive, Arch
 use crate::registry::{fetch_registry, RegistryEntry};
 use crate::source::{official_source, RegistrySource};
 use crate::state::{format_ts, load_state};
-// ── exit codes — the scripting contract (0 ok / 1 failure / 2 network /
-// 3 verification; finalized in V-16) ─────────────────────────────────────────
+// ── exit codes — the scripting contract, finalized in V-16 ─────────────────
+// 0 ok / 1 failure / 2 network / 3 verification (security refusal). The map is
+// TYPE-based: security refusals raise VynmError::Verification, never Internal.
 
 pub const EXIT_OK: i32 = 0;
 pub const EXIT_FAILURE: i32 = 1;
 pub const EXIT_NETWORK: i32 = 2;
 pub const EXIT_VERIFICATION: i32 = 3;
 
-/// Map an error onto the scripting contract. Ported security refusals raise
-/// `Internal` carrying the kernel-verbatim message texts, so verification-
-/// class failures are recognized by their canonical wording here until V-16
-/// restructures error variants if needed.
+/// Map an error onto the scripting contract.
 pub fn exit_code(err: &VynmError) -> i32 {
     match err {
         VynmError::Network(_) => EXIT_NETWORK,
-        VynmError::Internal(m)
-            if m.contains("signature")
-                || m.contains("integrity check failed")
-                || m.contains("revoked by the maintainer")
-                || m.contains("Malformed archive")
-                || m.contains("path traversal") =>
-        {
-            EXIT_VERIFICATION
-        }
+        VynmError::Verification(_) => EXIT_VERIFICATION,
         _ => EXIT_FAILURE,
     }
 }
@@ -262,6 +253,13 @@ pub struct Cli {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum CacheCmd {
+    /// Delete every cached registry document (<state_dir>/registry-cache);
+    /// the ledger is untouched
+    Clean,
+}
+
+#[derive(Debug, Subcommand)]
 pub enum Command {
     /// Install a plugin from a registry, or a local archive / direct archive
     /// URL (V-15). Ambiguity rule: an argument starting with http(s)://,
@@ -280,17 +278,37 @@ pub enum Command {
         /// URLs (the archive-mode equivalent of allow_unsigned on a source)
         #[arg(long)]
         allow_unsigned: bool,
+        /// V-16: resolve and print the plan (permissions included), write nothing
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Search the registry
     Search {
         query: String,
         #[arg(long)]
         source: Option<String>,
+        /// V-16: machine-readable JSON output
+        #[arg(long)]
+        json: bool,
     },
     /// List installed plugins (from the local ledger)
     List {
         #[arg(long)]
         source: Option<String>,
+        /// V-16: machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show registry details for one plugin: description, versions,
+    /// permissions, digests, kernel-compat bounds (V-16)
+    Info {
+        /// `[<source>/]<slug>[@<version>]` — same grammar as install
+        target: String,
+        #[arg(long)]
+        source: Option<String>,
+        /// V-16: machine-readable JSON output
+        #[arg(long)]
+        json: bool,
     },
     /// Remove an installed plugin (dir + ledger record + drop-in)
     Remove { slug: String },
@@ -306,7 +324,11 @@ pub enum Command {
     },
     /// Report installed plugins vs their ORIGIN registries (V-12). Report
     /// only — always exits 0.
-    Outdated,
+    Outdated {
+        /// V-16: machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
     /// Update installed plugins from their origin sources (V-12). Batch plan,
     /// ONE confirmation; strictly-newer versions only. Equal version with a
     /// different digest is a rebuild — needs --force. Downgrades never apply.
@@ -319,6 +341,29 @@ pub enum Command {
         /// skip the batch confirmation prompt (scripts/CI)
         #[arg(short = 'y', long)]
         yes: bool,
+        /// V-16: print the batch plan and stop — nothing is applied
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Manage the local registry cache (V-16)
+    Cache {
+        #[command(subcommand)]
+        action: CacheCmd,
+    },
+    /// Emit shell completion scripts for vynm (V-16)
+    Completions {
+        /// Shell to generate the script for
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
+    /// Hidden helper for dynamic slug completion: prints slugs from the local
+    /// registry cache instantly/offline; network only when no usable cache
+    /// exists (C2, V-16 note).
+    #[command(hide = true, name = "__complete-slugs")]
+    CompleteSlugs {
+        /// restrict to one configured source instead of all caches
+        #[arg(long)]
+        source: Option<String>,
     },
     /// Generate an ed25519 signing key pair for registry publishing (V-14)
     Keygen {
@@ -382,6 +427,7 @@ pub async fn run(cli: &Cli) -> Result<(), VynmError> {
             return keygen_cmd(name.as_deref(), out.as_deref(), *force)
         }
         Command::New { name, force } => return new_cmd(name, *force),
+        Command::Completions { shell } => return completions_cmd(*shell),
         Command::Sign {
             key,
             slug,
@@ -418,6 +464,7 @@ pub async fn run(cli: &Cli) -> Result<(), VynmError> {
             source,
             yes,
             allow_unsigned,
+            dry_run,
         } => match classify_install_target(slug)? {
             // V-15 archive mode: no registry resolution, --source is a misuse
             InstallKind::Archive => {
@@ -426,30 +473,54 @@ pub async fn run(cli: &Cli) -> Result<(), VynmError> {
                         "--source does not apply to local-archive/direct-URL installs".into(),
                     ));
                 }
-                install_archive_cmd(&ctx, slug, *allow_unsigned, *yes).await
+                install_archive_cmd(&ctx, slug, *allow_unsigned, *yes, *dry_run).await
             }
             InstallKind::Registry => {
                 let pinned = pin_source(&ctx, source.as_deref(), slug)?;
-                install_cmd(&ctx, pinned.as_ref(), slug, *yes)
+                install_cmd(&ctx, pinned.as_ref(), slug, *yes, *dry_run)
                     .await
                     .map(|_| ())
             }
         },
-        Command::Search { query, source } => {
+        Command::Search {
+            query,
+            source,
+            json,
+        } => {
             let pinned = pin_source(&ctx, source.as_deref(), query)?;
-            search_cmd(&ctx, pinned.as_ref(), query).await.map(|_| ())
+            search_cmd(&ctx, pinned.as_ref(), query, *json)
+                .await
+                .map(|_| ())
         }
-        Command::List { source } => list_cmd(&ctx, source.as_deref()),
+        Command::List { source, json } => list_cmd(&ctx, source.as_deref(), *json),
+        Command::Info {
+            target,
+            source,
+            json,
+        } => {
+            let pinned = pin_source(&ctx, source.as_deref(), target)?;
+            info_cmd(&ctx, pinned.as_ref(), target, *json).await
+        }
         Command::Remove { slug } => remove_cmd(&ctx, slug),
         Command::Enable { slug } => enable_cmd(&ctx, slug),
         Command::Disable { slug } => disable_cmd(&ctx, slug),
         Command::Verify { slug } => crate::verify::verify_cmd(&ctx.tmp_dir, slug.as_deref()),
-        Command::Outdated => crate::update::outdated_cmd(&ctx).await,
-        Command::Update { slug, force, yes } => {
-            crate::update::update_cmd(&ctx, slug.as_deref(), *force, *yes).await
-        }
+        Command::Outdated { json } => crate::update::outdated_cmd(&ctx, *json).await,
+        Command::Update {
+            slug,
+            force,
+            yes,
+            dry_run,
+        } => crate::update::update_cmd(&ctx, slug.as_deref(), *force, *yes, *dry_run).await,
+        Command::Cache {
+            action: CacheCmd::Clean,
+        } => cache_clean_cmd(&ctx.tmp_dir),
+        Command::CompleteSlugs { source } => complete_slugs_cmd(&ctx, source.as_deref()).await,
         // all handled above, before Ctx::load
-        Command::Keygen { .. } | Command::Sign { .. } | Command::New { .. } => Ok(()),
+        Command::Keygen { .. }
+        | Command::Sign { .. }
+        | Command::New { .. }
+        | Command::Completions { .. } => Ok(()),
     }
 }
 
@@ -779,6 +850,7 @@ async fn install_cmd(
     pinned: Option<&RegistrySource>,
     target: &str,
     yes: bool,
+    dry_run: bool,
 ) -> Result<ResolutionReceipt, VynmError> {
     let t = parse_target(target);
     let slug = t.slug;
@@ -790,6 +862,16 @@ async fn install_cmd(
     };
 
     println!("resolved from {}", src.name);
+
+    if dry_run {
+        let entry = find_install_entry(&entries, slug)?;
+        print!("{}", format_entry_preview(entry));
+        println!("dry run: nothing written");
+        return Ok(ResolutionReceipt {
+            source_name: src.name,
+        });
+    }
+
     let installed = install(
         &entries,
         slug,
@@ -837,6 +919,7 @@ async fn install_archive_cmd(
     origin: &str,
     allow_unsigned: bool,
     yes: bool,
+    dry_run: bool,
 ) -> Result<(), VynmError> {
     let kind = if origin.starts_with("http://") || origin.starts_with("https://") {
         ArchiveOrigin::DirectUrl(origin.to_string())
@@ -847,6 +930,11 @@ async fn install_archive_cmd(
         }
         ArchiveOrigin::LocalPath(path)
     };
+
+    if dry_run {
+        print_archive_dry_run(&kind)?;
+        return Ok(());
+    }
 
     let installed = install_archive(
         &kind,
@@ -884,6 +972,201 @@ async fn install_archive_cmd(
     Ok(())
 }
 
+// ── V-16: info / cache clean / completions / dry-run helpers ────────────────
+
+/// The entry an unpinned `info` presents: highest non-revoked semver among
+/// slug matches (mirrors update's pick semantics); document order as the
+/// fallback when nothing parses.
+fn pick_info_entry<'a>(entries: &'a [RegistryEntry], slug: &str) -> Option<&'a RegistryEntry> {
+    let matches: Vec<&RegistryEntry> = entries
+        .iter()
+        .filter(|e| e.slug == slug || e.id == slug)
+        .collect();
+    let best = matches
+        .iter()
+        .filter(|e| !e.is_revoked())
+        .filter_map(|e| semver::Version::parse(&e.version).ok().map(|v| (v, *e)))
+        .max_by(|a, b| a.0.cmp(&b.0))
+        .map(|(_, e)| e);
+    best.or_else(|| matches.first().copied())
+}
+
+fn format_entry_permissions(entry: &RegistryEntry) -> String {
+    if entry.permissions.is_empty() {
+        "(none)".into()
+    } else {
+        entry.permissions.join(", ")
+    }
+}
+
+/// Dry-run plan block from the REGISTRY ENTRY. The staged-manifest preview
+/// (V-10) needs the archive bytes; dry-run must not fetch them, so per-action
+/// requirements are absent here by design — permissions come from the document.
+pub fn format_entry_preview(entry: &RegistryEntry) -> String {
+    format!(
+        "would install {} @ {} ({})\npermissions: {}\nsha256: {}\nkernel compat: >= {}, <= {}\n",
+        entry.slug,
+        entry.version,
+        entry.status,
+        format_entry_permissions(entry),
+        entry.sha256,
+        entry.min_kernel_version,
+        entry.max_kernel_version,
+    )
+}
+
+/// First slug/id match — exactly what `install()` would pick, so the dry-run
+/// plan never lies about the target version when documents carry multiple.
+fn find_install_entry<'a>(
+    entries: &'a [RegistryEntry],
+    slug: &str,
+) -> Result<&'a RegistryEntry, VynmError> {
+    entries
+        .iter()
+        .find(|e| e.slug == slug || e.id == slug)
+        .ok_or_else(|| {
+            VynmError::PluginNotFound(format!(
+                "Plugin '{slug}' not found. Run 'vynm search <slug>' to browse."
+            ))
+        })
+}
+
+/// V-16 archive-mode dry-run: local archives get their real digest computed;
+/// direct URLs are NOT fetched (a dry run moves no bytes) and say so. Callers
+/// only reach here with http(s)/local-path targets (classification upstream).
+fn print_archive_dry_run(kind: &ArchiveOrigin) -> Result<(), VynmError> {
+    match kind {
+        ArchiveOrigin::LocalPath(path) => {
+            let bytes = std::fs::read(path)?;
+            println!(
+                "{}",
+                crate::installer::format_local_archive_notice(&crate::installer::sha256_hex(
+                    &bytes
+                ))
+            );
+            println!("would install from {}", path.display());
+        }
+        ArchiveOrigin::DirectUrl(url) => {
+            println!("would download {url}");
+            println!("sha256: (not fetched — dry run moves no bytes)");
+        }
+    }
+    println!("dry run: nothing written");
+    Ok(())
+}
+
+/// `vynm info [<source>/]<slug>[@<version>]` (V-16): resolution mirrors
+/// install (origin-first bare-slug probe), presentation mirrors outdated.
+async fn info_cmd(
+    ctx: &Ctx,
+    pinned: Option<&RegistrySource>,
+    target: &str,
+    json: bool,
+) -> Result<(), VynmError> {
+    let t = parse_target(target);
+    let slug = t.slug;
+    let (src, entries) = match t.version {
+        Some(ver) => resolve_pinned(ctx, pinned, slug, ver).await?,
+        None => resolve_unpinned(ctx, pinned, slug).await?,
+    };
+
+    let mut versions: Vec<String> = entries
+        .iter()
+        .filter(|e| e.slug == slug || e.id == slug)
+        .map(|e| e.version.clone())
+        .collect();
+    versions.sort();
+    versions.dedup();
+
+    let entry = match t.version {
+        // resolve_pinned narrowed `entries` to exactly the pinned version
+        Some(_pin) => find_install_entry(&entries, slug)?,
+        None => pick_info_entry(&entries, slug).ok_or_else(|| {
+            VynmError::PluginNotFound(format!(
+                "Plugin '{slug}' not found. Run 'vynm search <slug>' to browse."
+            ))
+        })?,
+    };
+
+    if json {
+        let doc = serde_json::json!({
+            "resolved_from": src.name,
+            "versions": versions,
+            "entry": entry,
+        });
+        println!("{doc}");
+        return Ok(());
+    }
+
+    println!("resolved from {}", src.name);
+    println!();
+    println!("{:<14}{}", "name:", entry.name);
+    println!("{:<14}{}", "description:", entry.description);
+    println!("{:<14}{}", "version:", entry.version);
+    println!("{:<14}{}", "status:", entry.status);
+    println!("{:<14}{}", "permissions:", format_entry_permissions(entry));
+    println!("{:<14}{}", "min_kernel:", entry.min_kernel_version);
+    println!("{:<14}{}", "max_kernel:", entry.max_kernel_version);
+    println!("{:<14}{}", "archive_url:", entry.archive_url);
+    println!("{:<14}{}", "sha256:", entry.sha256);
+    println!(
+        "{:<14}{}",
+        "signature:",
+        if entry.signature.is_empty() {
+            "none"
+        } else {
+            "present"
+        }
+    );
+    println!();
+    println!("versions: {}", versions.join(", "));
+    Ok(())
+}
+
+/// `vynm cache clean` (V-16): delete every cached registry document. The
+/// ledger is untouched; caches rebuild on the next fetch.
+fn cache_clean_cmd(tmp_dir: &Path) -> Result<(), VynmError> {
+    let dir = crate::registry::registry_cache_dir(tmp_dir);
+    if !dir.is_dir() {
+        println!("cache is empty — nothing to clean ({})", dir.display());
+        return Ok(());
+    }
+    let mut removed = 0usize;
+    for item in fs::read_dir(&dir)? {
+        let entry = item?;
+        if entry.file_type()?.is_file() {
+            fs::remove_file(entry.path())?;
+            removed += 1;
+        }
+    }
+    let _ = fs::remove_dir(&dir);
+    println!("removed {removed} cache file(s) from {}", dir.display());
+    Ok(())
+}
+
+/// `vynm completions <shell>` (V-16): emit the completion script for the
+/// parsed clap surface so it can never drift from the real grammar.
+fn completions_cmd(shell: clap_complete::Shell) -> Result<(), VynmError> {
+    use clap::CommandFactory;
+    let mut cmd = Cli::command();
+    clap_complete::generate(shell, &mut cmd, "vynm", &mut std::io::stdout());
+    std::io::stdout().flush().map_err(VynmError::Io)?;
+    Ok(())
+}
+
+/// Hidden `__complete-slugs` (C2/V-16): one slug per line for dynamic shell
+/// completion scripts.
+async fn complete_slugs_cmd(ctx: &Ctx, source: Option<&str>) -> Result<(), VynmError> {
+    let sources: Vec<RegistrySource> = match source {
+        Some(name) => vec![ctx.resolve_source(Some(name))?],
+        None => ctx.sources.clone(),
+    };
+    for slug in crate::registry::complete_slugs_cached_first(&sources, &ctx.tmp_dir).await? {
+        println!("{slug}");
+    }
+    Ok(())
+}
+
 /// search hits for a lowercased query — shared by the probe predicate and
 /// the table printer so both see exactly the same matches (owned clones: the
 /// probe's registry document doesn't outlive resolution)
@@ -901,24 +1184,70 @@ fn matching_entries(entries: &[RegistryEntry], q: &str) -> Vec<RegistryEntry> {
     hits
 }
 
-/// `None` = nothing matched anywhere — still exit 0, like single-source era.
+// ── V-16 rendering: pure builders so --json shapes are unit-testable ───────
+
+#[derive(serde::Serialize)]
+struct SearchHitJson<'a> {
+    slug: &'a str,
+    version: &'a str,
+    status: &'a str,
+    name: &'a str,
+}
+
+#[derive(serde::Serialize)]
+struct SearchResultJson<'a> {
+    resolved_from: Option<&'a str>,
+    results: Vec<SearchHitJson<'a>>,
+}
+
+fn render_search_json(resolved_from: Option<&str>, hits: &[RegistryEntry]) -> String {
+    let doc = SearchResultJson {
+        resolved_from,
+        results: hits
+            .iter()
+            .map(|e| SearchHitJson {
+                slug: &e.slug,
+                version: &e.version,
+                status: if e.is_revoked() { "revoked" } else { &e.status },
+                name: &e.name,
+            })
+            .collect(),
+    };
+    serde_json::to_string(&doc).unwrap_or_else(|_| "{}".into())
+}
+
+fn render_search_table(source_name: &str, hits: &[RegistryEntry]) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "{:<24} {:<10} {:<10} {:<12} NAME\n",
+        "SLUG", "VERSION", "STATUS", "SOURCE"
+    ));
+    for e in hits {
+        let status = if e.is_revoked() { "revoked" } else { &e.status };
+        out.push_str(&format!(
+            "{:<24} {:<10} {:<10} {:<12} {}\n",
+            e.slug, e.version, status, source_name, e.name
+        ));
+    }
+    out
+}
+
+/// `--json` = machine-readable; `None` resolved_from + empty results is the
+/// no-match shape. Human mode keeps `no matches for '<q>'`.
 async fn search_cmd(
     ctx: &Ctx,
     pinned: Option<&RegistrySource>,
     query: &str,
+    json: bool,
 ) -> Result<Option<ResolutionReceipt>, VynmError> {
     let q = query.to_ascii_lowercase();
     let wants = |entries: &[RegistryEntry]| !matching_entries(entries, &q).is_empty();
 
-    let (source_name, hits): (String, Vec<RegistryEntry>) = match pinned {
+    let (resolved_from, hits): (Option<String>, Vec<RegistryEntry>) = match pinned {
         Some(src) => {
             let entries = fetch_registry(src, false, &ctx.tmp_dir).await?;
             let hits = matching_entries(&entries, &q);
-            if hits.is_empty() {
-                println!("no matches for '{query}'");
-                return Ok(None);
-            }
-            (src.name.clone(), hits)
+            (Some(src.name.clone()), hits)
         }
         None => {
             // bare query: ledger-origin lookup only fires when the query is
@@ -928,33 +1257,63 @@ async fn search_cmd(
             let candidates = bare_slug_candidates(&ctx.sources, origin);
             match probe_sources(&candidates, &ctx.tmp_dir, wants).await? {
                 ProbeOutcome::Found(src, entries) => {
-                    let hits = matching_entries(&entries, &q);
-                    if hits.is_empty() {
-                        println!("no matches for '{query}'");
-                        return Ok(None);
-                    }
-                    (src.name.clone(), hits)
+                    (Some(src.name.clone()), matching_entries(&entries, &q))
                 }
-                ProbeOutcome::NoMatch(_) => {
-                    println!("no matches for '{query}'");
-                    return Ok(None);
-                }
+                ProbeOutcome::NoMatch(_) => (None, Vec::new()),
             }
         }
     };
 
-    println!("resolved from {source_name}");
-    println!("{:<24} {:<10} {:<10} NAME", "SLUG", "VERSION", "STATUS");
-    for e in hits {
-        let status = if e.is_revoked() { "revoked" } else { &e.status };
-        println!("{:<24} {:<10} {:<10} {}", e.slug, e.version, status, e.name);
+    if hits.is_empty() {
+        if json {
+            println!("{}", render_search_json(resolved_from.as_deref(), &[]));
+        } else {
+            println!("no matches for '{query}'");
+        }
+        return Ok(None);
     }
-    Ok(Some(ResolutionReceipt { source_name }))
+    let source_name = resolved_from.as_deref().expect("hits imply a source");
+    if json {
+        println!("{}", render_search_json(Some(source_name), &hits));
+    } else {
+        print!(
+            "resolved from {source_name}\n{}",
+            render_search_table(source_name, &hits)
+        );
+    }
+    Ok(Some(ResolutionReceipt {
+        source_name: source_name.to_string(),
+    }))
+}
+
+#[derive(serde::Serialize)]
+struct ListRowJson<'a> {
+    slug: &'a str,
+    version: &'a str,
+    sha256: &'a str,
+    source: &'a str,
+    installed_at: String,
+    path: String,
+}
+
+fn render_list_json(ctx: &Ctx, rows: &[&crate::state::InstalledEntry]) -> String {
+    let doc: Vec<ListRowJson<'_>> = rows
+        .iter()
+        .map(|e| ListRowJson {
+            slug: &e.slug,
+            version: &e.version,
+            sha256: &e.sha256,
+            source: &e.source,
+            installed_at: format_ts(e.installed_at),
+            path: plugin_dir(&ctx.tmp_dir).join(&e.slug).display().to_string(),
+        })
+        .collect();
+    serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "[]".into())
 }
 
 /// `--source <name>` filters rows by their recorded ledger origin; the name
 /// is validated against the configured list even when nothing is installed.
-fn list_cmd(ctx: &Ctx, source: Option<&str>) -> Result<(), VynmError> {
+fn list_cmd(ctx: &Ctx, source: Option<&str>, json: bool) -> Result<(), VynmError> {
     let want = source
         .map(|n| ctx.resolve_source(Some(n)).map(|_| n.to_string()))
         .transpose()?;
@@ -965,10 +1324,18 @@ fn list_cmd(ctx: &Ctx, source: Option<&str>) -> Result<(), VynmError> {
         .filter(|e| want.as_deref().is_none_or(|w| e.source == w))
         .collect();
     if rows.is_empty() {
+        if json {
+            println!("[]");
+            return Ok(());
+        }
         match &want {
             Some(w) => println!("no plugins installed from '{w}'"),
             None => println!("no plugins installed"),
         }
+        return Ok(());
+    }
+    if json {
+        println!("{}", render_list_json(ctx, &rows));
         return Ok(());
     }
     println!(

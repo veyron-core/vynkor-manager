@@ -90,3 +90,35 @@ fn short_sha_truncates_for_display() {
     assert_eq!(short_sha("abcdef1234567890"), "abcdef12");
     assert_eq!(short_sha(""), "");
 }
+
+// ── V-16: outdated --json shape ─────────────────────────────────────────────
+
+fn row_of(slug: &str, installed: &str, available: Option<&str>, kind: RowKind) -> Row {
+    Row {
+        slug: slug.into(),
+        installed_version: installed.into(),
+        installed_sha256: "deadbeef".into(),
+        source_name: "official".into(),
+        available_version: available.map(str::to_string),
+        available_sha256: None,
+        kind,
+    }
+}
+
+#[test]
+fn render_outdated_json_carries_status_and_versions() {
+    let rows = vec![
+        row_of("db", "1.0.0", Some("2.0.0"), RowKind::Outdated),
+        row_of("logger", "3.0.0", Some("3.0.0"), RowKind::UpToDate),
+    ];
+    let parsed: serde_json::Value = serde_json::from_str(&render_outdated_json(&rows)).unwrap();
+    assert_eq!(parsed[0]["slug"], "db");
+    assert_eq!(parsed[0]["installed_version"], "1.0.0");
+    assert_eq!(parsed[0]["available_version"], "2.0.0");
+    assert_eq!(parsed[0]["source"], "official");
+    assert_eq!(parsed[0]["status"], "OUTDATED");
+    assert_eq!(parsed[1]["status"], "ok");
+
+    let empty = render_outdated_json(&[]);
+    assert_eq!(empty.trim(), "[]", "no rows serialize as an empty array");
+}

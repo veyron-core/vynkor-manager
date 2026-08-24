@@ -185,7 +185,7 @@ pub async fn install(
     // R10-03 — a revoked entry is never installable, whether it came from a
     // fresh fetch or the stale cache: revocation outlives the cache TTL.
     if entry.is_revoked() {
-        return Err(VynmError::Internal(format!(
+        return Err(VynmError::Verification(format!(
             "Plugin '{}' v{} is revoked by the maintainer. Aborting — do not install.",
             entry.slug, entry.version
         )));
@@ -260,7 +260,7 @@ pub async fn install(
     let actual_hash = hex_encode(&Sha256::digest(&bytes));
     if actual_hash != entry.sha256 {
         let _ = fs::remove_dir_all(&stage_dir);
-        return Err(VynmError::Internal(format!(
+        return Err(VynmError::Verification(format!(
             "Archive integrity check failed. Expected {}, got {}. Aborting — do not proceed.",
             entry.sha256, actual_hash
         )));
@@ -439,6 +439,10 @@ pub fn format_local_archive_notice(sha256_hex: &str) -> String {
         "⚠ local archive: no registry signature / published-sha256 guarantee applies \
          (computed sha256: {sha256_hex})"
     )
+}
+
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    hex_encode(&Sha256::digest(bytes))
 }
 
 /// D8 for direct archive URLs (V-15): there is no source config here, so the
@@ -713,7 +717,7 @@ pub fn extract_zip(
         zip::ZipArchive::new(file).map_err(|e| VynmError::Internal(format!("open zip: {e}")))?;
 
     if zip.len() > max_archive_entries {
-        return Err(VynmError::Internal(format!(
+        return Err(VynmError::Verification(format!(
             "Malformed archive: {} entries exceeds max {max_archive_entries}. Aborting.",
             zip.len()
         )));
@@ -742,7 +746,7 @@ pub fn extract_zip(
             )
         });
         if candidate.is_absolute() || unsafe_components {
-            return Err(VynmError::Internal(format!(
+            return Err(VynmError::Verification(format!(
                 "Malformed archive: path traversal detected in entry '{name}'. Aborting."
             )));
         }
@@ -771,7 +775,7 @@ pub fn extract_zip(
             // Verify dir stayed inside dest after creation (catches symlink races).
             let canon_out = out.canonicalize().map_err(VynmError::Io)?;
             if !canon_out.starts_with(&canon_dest) {
-                return Err(VynmError::Internal(format!(
+                return Err(VynmError::Verification(format!(
                     "Malformed archive: entry '{name}' escapes extraction dir. Aborting."
                 )));
             }
@@ -780,7 +784,7 @@ pub fn extract_zip(
                 fs::create_dir_all(parent).map_err(VynmError::Io)?;
                 let canon_parent = parent.canonicalize().map_err(VynmError::Io)?;
                 if !canon_parent.starts_with(&canon_dest) {
-                    return Err(VynmError::Internal(format!(
+                    return Err(VynmError::Verification(format!(
                         "Malformed archive: entry '{name}' escapes extraction dir. Aborting."
                     )));
                 }
@@ -794,7 +798,7 @@ pub fn extract_zip(
                 .map_err(VynmError::Io)?;
             total_extracted += written;
             if total_extracted > max_extracted_bytes {
-                return Err(VynmError::Internal(format!(
+                return Err(VynmError::Verification(format!(
                     "Malformed archive: decompressed size exceeds max {max_extracted_bytes} bytes. Aborting."
                 )));
             }
@@ -810,7 +814,7 @@ pub fn extract_zip(
     }
 
     if let Some(missing_name) = missing.iter().next() {
-        return Err(VynmError::Internal(format!(
+        return Err(VynmError::Verification(format!(
             "Malformed archive: manifest `files` lists '{missing_name}' which is missing from the archive. Aborting."
         )));
     }

@@ -279,3 +279,135 @@ fn version_pin_on_archive_is_a_hard_error() {
         "unexpected: {msg}"
     );
 }
+
+// ── V-16: rendering, info picking, cache-first completion ───────────────────
+
+fn entry(slug: &str, version: &str, status: &str) -> crate::registry::RegistryEntry {
+    crate::registry::RegistryEntry {
+        id: slug.into(),
+        slug: slug.into(),
+        name: format!("the {slug} plugin"),
+        description: String::new(),
+        version: version.into(),
+        permissions: vec!["storage".into()],
+        archive_url: format!("/{slug}.zip"),
+        source_url: String::new(),
+        sha256: "deadbeef".into(),
+        min_kernel_version: "0.1.0".into(),
+        max_kernel_version: "*".into(),
+        signature: String::new(),
+        status: status.into(),
+    }
+}
+
+#[test]
+fn render_search_json_shape_is_stable() {
+    let hits = vec![
+        entry("db", "2.0.0", "stable"),
+        entry("x", "1.0.0", "revoked"),
+    ];
+    let parsed: serde_json::Value =
+        serde_json::from_str(&super::render_search_json(Some("corp"), &hits)).unwrap();
+    assert_eq!(parsed["resolved_from"], "corp");
+    assert_eq!(parsed["results"][0]["slug"], "db");
+    assert_eq!(parsed["results"][0]["status"], "stable");
+    // revocation is surfaced as status, never hidden
+    assert_eq!(parsed["results"][1]["status"], "revoked");
+
+    let no_match: serde_json::Value =
+        serde_json::from_str(&super::render_search_json(None, &[])).unwrap();
+    assert_eq!(no_match["resolved_from"], serde_json::Value::Null);
+    assert_eq!(no_match["results"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn render_search_table_has_source_column() {
+    let hits = vec![entry("db", "2.0.0", "stable")];
+    let table = super::render_search_table("corp", &hits);
+    assert!(table.contains("SOURCE"), "V-16 adds the SOURCE column");
+    assert!(table.contains(" corp "), "rows carry the serving source");
+}
+
+#[test]
+fn pick_info_entry_prefers_latest_non_revoked_semver() {
+    let doc = vec![
+        entry("db", "1.0.0", "stable"),
+        entry("db", "3.0.0", "stable"),
+        entry("db", "2.0.0", "stable"),
+    ];
+    let picked = super::pick_info_entry(&doc, "db").unwrap();
+    assert_eq!(picked.version, "3.0.0");
+
+    let revoked_leads = vec![
+        entry("db", "9.9.9", "revoked"),
+        entry("db", "1.0.0", "stable"),
+    ];
+    let picked = super::pick_info_entry(&revoked_leads, "db").unwrap();
+    assert_eq!(picked.version, "1.0.0", "revoked never wins info");
+
+    let unparsable_only = vec![entry("db", "not-semver", "stable")];
+    let picked = super::pick_info_entry(&unparsable_only, "db").unwrap();
+    assert_eq!(picked.version, "not-semver", "document-order fallback");
+}
+
+#[test]
+fn dry_run_preview_states_plan_without_manifest_actions() {
+    let preview = super::format_entry_preview(&entry("db", "2.0.0", "beta"));
+    assert!(
+        preview.contains("would install db @ 2.0.0 (beta)"),
+        "{preview}"
+    );
+    assert!(preview.contains("permissions: storage"), "{preview}");
+    assert!(preview.contains("sha256: deadbeef"), "{preview}");
+}
+
+#[test]
+fn cached_slugs_reads_cache_ignoring_ttl() {
+    use crate::registry::{cached_slugs, RegistryCache, REGISTRY_CACHE_SCHEMA_VERSION};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("official.json");
+    let cache = RegistryCache {
+        schema_version: REGISTRY_CACHE_SCHEMA_VERSION,
+        entries: vec![
+            entry("zeta", "1.0.0", "stable"),
+            entry("alpha", "1.0.0", "stable"),
+            entry("zeta", "2.0.0", "stable"),
+        ],
+        ..Default::default()
+    };
+    std::fs::write(&path, serde_json::to_string(&cache).unwrap()).unwrap();
+    assert_eq!(
+        cached_slugs(&path),
+        vec!["alpha".to_string(), "zeta".to_string()],
+        "unique + sorted"
+    );
+
+    assert!(cached_slugs(&dir.path().join("absent.json")).is_empty());
+    std::fs::write(dir.path().join("bad.json"), "not json{").unwrap();
+    assert!(
+        cached_slugs(&dir.path().join("bad.json")).is_empty(),
+        "corrupt cache reads empty"
+    );
+}
+
+use clap::CommandFactory as _;
+
+#[test]
+fn completions_generate_for_all_contract_shells() {
+    // bash/zsh/fish are the scripting contract in VYNM_ROADMAP V-16
+    for shell in [
+        clap_complete::Shell::Bash,
+        clap_complete::Shell::Zsh,
+        clap_complete::Shell::Fish,
+    ] {
+        let mut cmd = Cli::command();
+        let mut buf: Vec<u8> = Vec::new();
+        clap_complete::generate(shell, &mut cmd, "vynm", &mut buf);
+        let script = String::from_utf8(buf).unwrap();
+        assert!(!script.is_empty(), "{shell:?} must emit a script");
+        assert!(
+            script.contains("vynm"),
+            "{shell:?} script must name the binary"
+        );
+    }
+}
