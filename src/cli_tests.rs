@@ -7,7 +7,7 @@ const SEED: [u8; 32] = [42; 32];
 
 fn sign_cli(key: Option<&std::path::Path>, verify: bool) -> Cli {
     Cli {
-        config: "config.yaml".into(),
+        config: None,
         command: Command::Sign {
             key: key.map(|p| p.to_path_buf()),
             slug: "demo".into(),

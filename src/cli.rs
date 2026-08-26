@@ -187,6 +187,23 @@ fn scratch_base() -> PathBuf {
     std::env::temp_dir().join(format!("vynm-{}", std::process::id()))
 }
 
+/// Which config file a run uses: explicit `--config` > `$VYN_CONFIG` >
+/// legacy `./config.yaml` (when present) > the default product path
+/// (`~/.config/vyn/config.yaml`, auto-seeded on first use).
+pub fn effective_config_path(explicit: Option<&str>) -> PathBuf {
+    if let Some(p) = explicit {
+        return PathBuf::from(p);
+    }
+    if let Ok(p) = std::env::var("VYN_CONFIG") {
+        return PathBuf::from(p);
+    }
+    let legacy = PathBuf::from("config.yaml");
+    if legacy.exists() {
+        return legacy;
+    }
+    crate::init::default_product_config_path().unwrap_or_else(|| scratch_base().join("config.yaml"))
+}
+
 impl Ctx {
     pub fn load(config_path: &str) -> Result<Self, VynmError> {
         let raw = match std::fs::read_to_string(config_path) {
@@ -203,7 +220,6 @@ impl Ctx {
             tmp_dir: scratch_base(),
         })
     }
-
     /// configured source names, in listed order — error listings use this
     pub fn source_names(&self) -> Vec<&str> {
         self.sources.iter().map(|s| s.name.as_str()).collect()
@@ -244,9 +260,11 @@ pub(crate) const MAX_ARCHIVE_ENTRIES: usize = 100_000;
     about = "vynm — plugin marketplace manager for the vynkor kernel"
 )]
 pub struct Cli {
-    /// Path to the kernel's config.yaml — drop-ins and registries derive from it
-    #[arg(long, global = true, default_value = "config.yaml")]
-    pub config: String,
+    /// Path to the kernel's config.yaml — drop-ins and registries derive
+    /// from it. Discovery when omitted: $VYN_CONFIG > ./config.yaml (if
+    /// present) > ~/.config/vyn/config.yaml (created on first use)
+    #[arg(long, global = true)]
+    pub config: Option<String>,
 
     #[command(subcommand)]
     pub command: Command,
@@ -286,6 +304,13 @@ pub enum BundleCmd {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Write the fully-commented starter config (official registry
+    /// pre-filled). Idempotent without --force.
+    Init {
+        /// regenerate even if the file already exists
+        #[arg(long)]
+        force: bool,
+    },
     /// Install a plugin from a registry, or a local archive / direct archive
     /// URL. Ambiguity rule: an argument starting with http(s)://,
     /// `./`, `../` or `/`, or ending in `.zip`, is an ARCHIVE install;
@@ -487,8 +512,12 @@ pub enum Command {
 
 /// Dispatch a parsed invocation; errors bubble to main for exit-code mapping.
 pub async fn run(cli: &Cli) -> Result<(), VynmError> {
-    // keygen/sign/new are local ops — no config file, no network
+    // keygen/sign/new/init are local ops — no config file, no network
     match &cli.command {
+        Command::Init { force } => {
+            let path = effective_config_path(cli.config.as_deref());
+            return crate::init::init_cmd(&path, *force).map(|_| ());
+        }
         Command::Keygen { name, out, force } => {
             return keygen_cmd(name.as_deref(), out.as_deref(), *force)
         }
@@ -551,7 +580,14 @@ pub async fn run(cli: &Cli) -> Result<(), VynmError> {
         }
         _ => {}
     }
-    let ctx = Ctx::load(&cli.config)?;
+    let config_path = effective_config_path(cli.config.as_deref());
+    crate::init::seed_default_config_if_missing(&config_path);
+    let ctx = Ctx::load(config_path.to_str().ok_or_else(|| {
+        VynmError::InvalidInput(format!(
+            "config path is not valid utf-8: {}",
+            config_path.display()
+        ))
+    })?)?;
     match &cli.command {
         Command::Install {
             slug,
@@ -618,7 +654,8 @@ pub async fn run(cli: &Cli) -> Result<(), VynmError> {
         } => crate::bundle::import(&ctx.tmp_dir, &ctx.plugins_dir, archive, *force).map(|_| ()),
         Command::CompleteSlugs { source } => complete_slugs_cmd(&ctx, source.as_deref()).await,
         // all handled above, before Ctx::load
-        Command::Keygen { .. }
+        Command::Init { .. }
+        | Command::Keygen { .. }
         | Command::Sign { .. }
         | Command::New { .. }
         | Command::Package { .. }
