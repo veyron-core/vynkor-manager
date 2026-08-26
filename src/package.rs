@@ -7,8 +7,9 @@
 //! - NO `cargo build`: vynm packages what already exists — `manifest.binary`
 //!   must be present under `<dir>`; build orchestration belongs to the
 //!   plugins repo CI, not the marketplace manager.
-//! - NO `-src.zip` (follow-up); the four steps the backlog names — zip +
-//!   checksum + sign + upsert — are all covered.
+//! - The `-src.zip` mirrors package.sh (`<slug>-src/` prefix, plugin.json +
+//!   Cargo.toml + src/) but is skipped entirely for non-Rust plugin dirs
+//!   with neither Cargo.toml nor src/.
 //! - Signing is optional exactly like package.sh: no `--key` ⇒ empty
 //!   signature (`vynm install` rejects the entry until it is signed) and no
 //!   `signature.sig` file.
@@ -115,6 +116,46 @@ fn collect_archive_files(
             )));
         }
         out.push((base, source));
+    }
+    Ok(out)
+}
+
+/// Resolve which files go into the SOURCE archive: `plugin.json` always,
+/// plus `Cargo.toml` and the whole `src/` tree when present (package.sh
+/// parity). Members live under a `<slug>-src/` top-level directory. An empty
+/// result means there is nothing beyond plugin.json — no source archive.
+fn collect_src_files(dir: &Path, slug: &str) -> Result<Vec<(String, PathBuf)>, VynmError> {
+    let mut out: Vec<(String, PathBuf)> =
+        vec![(format!("{slug}-src/plugin.json"), dir.join("plugin.json"))];
+    let cargo = dir.join("Cargo.toml");
+    if cargo.is_file() {
+        out.push((format!("{slug}-src/Cargo.toml"), cargo));
+    }
+    let src_dir = dir.join("src");
+    if src_dir.is_dir() {
+        fn walk(
+            disk: &Path,
+            members: &str,
+            out: &mut Vec<(String, PathBuf)>,
+        ) -> Result<(), VynmError> {
+            for entry in fs::read_dir(disk)? {
+                let entry = entry?;
+                if entry.file_type()?.is_symlink() {
+                    continue;
+                }
+                let rel = format!("{members}/{}", entry.file_name().to_string_lossy());
+                if entry.file_type()?.is_dir() {
+                    walk(&entry.path(), &rel, out)?;
+                } else {
+                    out.push((rel, entry.path()));
+                }
+            }
+            Ok(())
+        }
+        walk(&src_dir, &format!("{slug}-src/src"), &mut out)?;
+    }
+    if out.len() == 1 {
+        return Ok(Vec::new());
     }
     Ok(out)
 }
@@ -346,6 +387,23 @@ pub fn run(opts: PackageOpts<'_>) -> Result<(), VynmError> {
     )
     .map_err(VynmError::Io)?;
 
+    // Source archive (package.sh parity): <slug>-src/{plugin.json,Cargo.toml,
+    // src/**}. Skipped when the dir carries nothing beyond plugin.json.
+    let src_files = collect_src_files(opts.dir, &slug)?;
+    let mut src_written: Option<PathBuf> = None;
+    if !src_files.is_empty() {
+        let src_archive = version_dir.join(format!("{slug}-{version}-src.zip"));
+        if src_archive.exists() && !opts.force {
+            return Err(VynmError::InvalidInput(format!(
+                "{} already exists — pass --force to replace it",
+                src_archive.display()
+            )));
+        }
+        let _ = fs::remove_file(&src_archive);
+        write_zip(&src_files, &src_archive)?;
+        src_written = Some(src_archive);
+    }
+
     // Relative archive_url — resolved against the registry's own base URL by
     // the installer, so host migration never breaks signatures (the S1
     // message covers the URL AS WRITTEN).
@@ -408,6 +466,9 @@ pub fn run(opts: PackageOpts<'_>) -> Result<(), VynmError> {
 
     println!("✓ packaged {}", archive_path.display());
     println!("  sha256:      {sha256}");
+    if let Some(src) = &src_written {
+        println!("  src archive: {}", src.display());
+    }
     println!("  archive_url: {archive_url}");
     if entry.signature.is_empty() {
         println!("  signature:   (none — unsigned entry)");

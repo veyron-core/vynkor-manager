@@ -241,7 +241,7 @@ pub(crate) const MAX_ARCHIVE_ENTRIES: usize = 100_000;
 #[command(
     name = "vynm",
     version,
-    about = "vynm — plugin marketplace manager for the Veyron/vynkor kernel"
+    about = "vynm — plugin marketplace manager for the vynkor kernel"
 )]
 pub struct Cli {
     /// Path to the kernel's config.yaml — drop-ins and registries derive from it
@@ -262,7 +262,7 @@ pub enum CacheCmd {
 #[derive(Debug, Subcommand)]
 pub enum BundleCmd {
     /// Pack installed plugin trees + a filtered ledger into ONE offline zip
-    /// (air-gapped moves; roadmap parked item). No network, ever.
+    /// (moving plugins to air-gapped machines). No network, ever.
     Export {
         /// restrict to these slugs (default: every ledger entry)
         slugs: Vec<String>,
@@ -287,7 +287,7 @@ pub enum BundleCmd {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Install a plugin from a registry, or a local archive / direct archive
-    /// URL (V-15). Ambiguity rule: an argument starting with http(s)://,
+    /// URL. Ambiguity rule: an argument starting with http(s)://,
     /// `./`, `../` or `/`, or ending in `.zip`, is an ARCHIVE install;
     /// anything else is `[<source>/]<slug>[@<version>]` against registries.
     /// Archives are not versioned — `./x.zip@1.0` is a hard error.
@@ -296,14 +296,14 @@ pub enum Command {
         /// Registry source name (see the configured sources)
         #[arg(long)]
         source: Option<String>,
-        /// Skip the permission confirmation prompt (V-10) — for scripts/CI
+        /// Skip the permission confirmation prompt — for scripts/CI
         #[arg(long)]
         yes: bool,
-        /// V-15 archive installs only: accept insecure http:// direct archive
+        /// Archive installs only: accept insecure http:// direct archive
         /// URLs (the archive-mode equivalent of allow_unsigned on a source)
         #[arg(long)]
         allow_unsigned: bool,
-        /// V-16: resolve and print the plan (permissions included), write nothing
+        /// Resolve and print the plan (permissions included), write nothing
         #[arg(long)]
         dry_run: bool,
     },
@@ -312,7 +312,7 @@ pub enum Command {
         query: String,
         #[arg(long)]
         source: Option<String>,
-        /// V-16: machine-readable JSON output
+        /// Machine-readable JSON output
         #[arg(long)]
         json: bool,
     },
@@ -320,18 +320,18 @@ pub enum Command {
     List {
         #[arg(long)]
         source: Option<String>,
-        /// V-16: machine-readable JSON output
+        /// Machine-readable JSON output
         #[arg(long)]
         json: bool,
     },
     /// Show registry details for one plugin: description, versions,
-    /// permissions, digests, kernel-compat bounds (V-16)
+    /// permissions, digests, kernel-compat bounds
     Info {
         /// `[<source>/]<slug>[@<version>]` — same grammar as install
         target: String,
         #[arg(long)]
         source: Option<String>,
-        /// V-16: machine-readable JSON output
+        /// Machine-readable JSON output
         #[arg(long)]
         json: bool,
     },
@@ -341,20 +341,20 @@ pub enum Command {
     Enable { slug: String },
     /// Stop auto-spawning an installed plugin (drop-in renamed .disabled)
     Disable { slug: String },
-    /// Verify installed trees against the ledger's tree digests (V-13);
+    /// Verify installed trees against the ledger's tree digests;
     /// no slug = every ledger entry
     Verify {
         /// restrict the check to one installed plugin
         slug: Option<String>,
     },
-    /// Report installed plugins vs their ORIGIN registries (V-12). Report
+    /// Report installed plugins vs their ORIGIN registries. Report
     /// only — always exits 0.
     Outdated {
-        /// V-16: machine-readable JSON output
+        /// Machine-readable JSON output
         #[arg(long)]
         json: bool,
     },
-    /// Update installed plugins from their origin sources (V-12). Batch plan,
+    /// Update installed plugins from their origin sources. Batch plan,
     /// ONE confirmation; strictly-newer versions only. Equal version with a
     /// different digest is a rebuild — needs --force. Downgrades never apply.
     Update {
@@ -366,25 +366,25 @@ pub enum Command {
         /// skip the batch confirmation prompt (scripts/CI)
         #[arg(short = 'y', long)]
         yes: bool,
-        /// V-16: print the batch plan and stop — nothing is applied
+        /// Print the batch plan and stop — nothing is applied
         #[arg(long)]
         dry_run: bool,
     },
-    /// Manage the local registry cache (V-16)
+    /// Manage the local registry cache
     Cache {
         #[command(subcommand)]
         action: CacheCmd,
     },
-    /// Restore the previous installed version kept by the last update
-    /// (roadmap parked item). The `<slug>.prev` tree's digest is checked
-    /// against the ledger BEFORE the swap; running it twice toggles back.
+    /// Restore the previous installed version kept by the last update.
+    /// The backup tree's digest is checked against the ledger BEFORE the
+    /// swap; running rollback twice toggles back.
     Rollback { slug: String },
-    /// Air-gapped export/import of installed plugins (roadmap parked item)
+    /// Air-gapped export/import of installed plugins
     Bundle {
         #[command(subcommand)]
         action: BundleCmd,
     },
-    /// Emit shell completion scripts for vynm (V-16)
+    /// Emit shell completion scripts for vynm
     Completions {
         /// Shell to generate the script for
         #[arg(value_enum)]
@@ -392,14 +392,14 @@ pub enum Command {
     },
     /// Hidden helper for dynamic slug completion: prints slugs from the local
     /// registry cache instantly/offline; network only when no usable cache
-    /// exists (C2, V-16 note).
+    /// exists.
     #[command(hide = true, name = "__complete-slugs")]
     CompleteSlugs {
         /// restrict to one configured source instead of all caches
         #[arg(long)]
         source: Option<String>,
     },
-    /// Generate an ed25519 signing key pair for registry publishing (V-14)
+    /// Generate an ed25519 signing key pair for registry publishing
     Keygen {
         /// Name for the default output path (<name>.key)
         name: Option<String>,
@@ -410,7 +410,7 @@ pub enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Scaffold a new plugin project (V-20)
+    /// Scaffold a new plugin project
     New {
         name: String,
         /// Overwrite files in an existing target dir
@@ -418,7 +418,7 @@ pub enum Command {
         force: bool,
     },
     /// Sign (or with --verify, check) a registry entry over the canonical
-    /// seven-field message (V-14)
+    /// seven-field message
     Sign {
         /// Path to the hex-seed key file (from `vynm keygen`); required for
         /// signing, unused with --verify
@@ -451,10 +451,10 @@ pub enum Command {
         #[arg(long)]
         signature: Option<String>,
     },
-    /// Package a BUILT plugin directory into the dist/ tree + registry.json
-    /// (V-14 follow-up): zip + checksum.sha256 + signature.sig + v2 upsert.
-    /// Replaces scripts/package.sh's zip/checksum/sign/upsert steps; does NOT
-    /// run cargo build — package what already exists.
+    /// Package a BUILT plugin directory into the dist/ tree + registry.json:
+    /// zip + checksum.sha256 + signature.sig + v2 upsert. Replaces
+    /// scripts/package.sh's zip/checksum/sign/upsert steps; does NOT run
+    /// cargo build — package what already exists.
     Package {
         /// directory with plugin.json + the built binary
         dir: PathBuf,
