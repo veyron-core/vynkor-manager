@@ -4,6 +4,18 @@ Plugin marketplace manager for [vynkor](https://github.com/vynkor-core/vynkor).
 The binary is **`vynm`**: it installs, updates, and manages kernel plugins from
 registries.
 
+## Install
+
+```bash
+cargo install vynkor-manager   # provides `vynm`
+```
+
+On first use vynm creates `~/.config/vyn/config.yaml` with the official
+plugin registry pre-filled and every field documented inline — that file is
+the single place where download sources live; edit it to repoint or add
+sources. `vynm init [--force]` writes/regenerates the same starter config on
+demand.
+
 ## What's inside
 
 - `state` — `installed.json` ledger (`~/.local/share/vyn/` or
