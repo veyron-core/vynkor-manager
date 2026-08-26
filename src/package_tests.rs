@@ -276,6 +276,73 @@ fn upsert_preserves_other_slugs_revoked_and_merges_versions() {
     assert!(meta_pos < revoked_pos && revoked_pos < aaa_pos && aaa_pos < two_pos);
 }
 
+// ── source archive: <slug>-src/ members, skipped for non-Rust dirs ──────────
+
+#[test]
+fn src_zip_carries_prefixed_sources_when_cargo_present() {
+    let tmp = tempdir().unwrap();
+    let plugin_dir = tmp.path().join("rusty");
+    write_plugin_dir(&plugin_dir, "rusty", "0.4.0", "");
+    fs::write(plugin_dir.join("Cargo.toml"), "[package]\nname=\"rusty\"\n").unwrap();
+    fs::create_dir_all(plugin_dir.join("src/util")).unwrap();
+    fs::write(plugin_dir.join("src/main.rs"), "fn main() {}\n").unwrap();
+    fs::write(plugin_dir.join("src/util/mod.rs"), "// util\n").unwrap();
+    let repo_root = tmp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    run(opts(&plugin_dir, &repo_root, None, "Rusty")).unwrap();
+
+    let version_dir = repo_root.join("dist/rusty/versions/0.4.0");
+    let src_zip = version_dir.join("rusty-0.4.0-src.zip");
+    assert!(src_zip.is_file());
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(fs::read(src_zip).unwrap())).unwrap();
+    let mut names: Vec<String> = (0..zip.len())
+        .map(|i| zip.by_index(i).unwrap().name().to_string())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec![
+            "rusty-src/Cargo.toml",
+            "rusty-src/plugin.json",
+            "rusty-src/src/main.rs",
+            "rusty-src/src/util/mod.rs",
+        ]
+    );
+}
+
+#[test]
+fn src_zip_skipped_without_cargo_and_src() {
+    let tmp = tempdir().unwrap();
+    let plugin_dir = tmp.path().join("plain");
+    write_plugin_dir(&plugin_dir, "plain", "0.1.0", "");
+    let repo_root = tmp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    run(opts(&plugin_dir, &repo_root, None, "Plain")).unwrap();
+    assert!(!repo_root
+        .join("dist/plain/versions/0.1.0/plain-0.1.0-src.zip")
+        .exists());
+}
+
+#[test]
+fn existing_src_zip_refused_without_force_even_after_binary_removed() {
+    let tmp = tempdir().unwrap();
+    let plugin_dir = tmp.path().join("both");
+    write_plugin_dir(&plugin_dir, "both", "0.6.0", "");
+    fs::write(plugin_dir.join("Cargo.toml"), "[package]\n").unwrap();
+    fs::create_dir_all(plugin_dir.join("src")).unwrap();
+    fs::write(plugin_dir.join("src/lib.rs"), "").unwrap();
+    let repo_root = tmp.path().join("repo");
+    fs::create_dir_all(&repo_root).unwrap();
+
+    run(opts(&plugin_dir, &repo_root, None, "Both")).unwrap();
+    // guard scenario: binary archive gone, src zip still in place
+    fs::remove_file(repo_root.join("dist/both/versions/0.6.0/both-0.6.0.zip")).unwrap();
+    let err = run(opts(&plugin_dir, &repo_root, None, "Both")).unwrap_err();
+    assert!(err.to_string().contains("--force"), "{err}");
+}
+
 // ── latest_version helper ────────────────────────────────────────────────────
 
 #[test]
