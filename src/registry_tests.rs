@@ -511,6 +511,46 @@ fn v2_meta_is_carried_into_document() {
     assert!(parsed.entries.is_empty(), "no versions → no entries");
 }
 
+// explicit empty status normalizes to the documented default ("stable") —
+// older packagers wrote "" instead of omitting the key
+#[test]
+fn empty_status_normalizes_to_stable() {
+    let map_doc = r#"{
+      "agent": {
+        "name": "Agent",
+        "status": "",
+        "versions": {
+          "0.1.3": {
+            "archive_url": "dist/agent/versions/0.1.3/agent-0.1.3.zip",
+            "sha256": "aa",
+            "signature": "bb",
+            "min_kernel_version": "0.1.0",
+            "max_kernel_version": "*"
+          }
+        }
+      }
+    }"#;
+    let agent = parse_registry_document(map_doc)
+        .unwrap()
+        .entries
+        .pop()
+        .unwrap();
+    assert_eq!(agent.slug, "agent");
+    assert_eq!(agent.status, "stable");
+    assert!(!agent.is_revoked());
+
+    // flat-array form gets the same treatment
+    let flat_doc = r#"[
+      {"slug": "bare", "version": "1.0.0", "status": "", "archive_url": "x.zip"}
+    ]"#;
+    let bare = parse_registry_document(flat_doc)
+        .unwrap()
+        .entries
+        .pop()
+        .unwrap();
+    assert_eq!(bare.status, "stable");
+}
+
 #[test]
 fn resolves_relative_archive_urls_against_base_url() {
     let mut entries = vec![RegistryEntry {
