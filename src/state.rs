@@ -24,6 +24,22 @@ fn default_source() -> String {
     DEFAULT_SOURCE.to_string()
 }
 
+/// Snapshot of the version a plugin was demoted FROM when an install/update
+/// replaced it. Flat (one level) by deliberate design — `vynm rollback` swaps
+/// current ↔ previous symmetrically, so a nested `previous` would either
+/// diverge or balloon; a single hop is the whole contract. This is the
+/// metadata half of the roadmap parked item (the install pipeline's `.bak`
+/// mechanism was the other half, now kept as `<slug>.prev`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PreviousInstall {
+    pub version: String,
+    pub sha256: String,
+    pub installed_at: u64,
+    pub source_url: String,
+    pub source: String,
+    pub tree_sha256: Option<String>,
+}
+
 /// One recorded install in `installed.json` — the explicit state store that
 /// replaces filesystem-sniffing `~/.local/lib/vyn/plugins/<slug>` (R10-02).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -49,6 +65,14 @@ pub struct InstalledEntry {
     /// baseline instead of guessing.
     #[serde(default)]
     pub tree_sha256: Option<String>,
+    /// The version this install REPLACED, if any — captured at install time
+    /// from the ledger record being demoted. `None` = fresh install. Enables
+    /// `vynm rollback` (see [`PreviousInstall`]). Additive optional field:
+    /// old ledgers read cleanly (serde default) and the schema version was
+    /// deliberately NOT bumped — a missing `previous` simply means nothing to
+    /// roll back to.
+    #[serde(default)]
+    pub previous: Option<PreviousInstall>,
 }
 
 /// The on-disk shape of `installed.json`. Serialized with pretty JSON so an

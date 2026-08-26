@@ -3,8 +3,8 @@ use std::path::Path;
 
 use tempfile::tempdir;
 use vynkor_manager::dropin::{
-    disable_plugin_config, enable_plugin_config, remove_plugin_config, write_plugin_config,
-    DropinParams, Toggle,
+    disable_plugin_config, enable_plugin_config, remove_plugin_config, render_dropin,
+    write_plugin_config, DropinParams, Toggle,
 };
 
 fn params<'a>(slug: &'a str, binary: &'a str) -> DropinParams<'a> {
@@ -53,6 +53,36 @@ fn write_plugin_config_sandbox_false_renders() {
 
     let content = fs::read_to_string(plugins_dir.join("network.yaml")).unwrap();
     assert!(content.contains("sandbox: false"));
+}
+
+// non-linux render omits the sandbox key entirely (body ends cleanly after
+// max_restarts, no blank-line artifact) — §10 open question 2
+#[test]
+fn render_dropin_without_sandbox_omits_key() {
+    let p = params("ping-pong", "/x/ping-pong-rs");
+    let body = render_dropin(&p, false);
+
+    assert!(!body.contains("sandbox:"));
+    assert_eq!(
+        body.lines().last(),
+        Some("max_restarts: 5"),
+        "body must end after max_restarts with no trailing blank line"
+    );
+
+    // id / binary / restart / max_restarts still present, in order
+    let id = body.find("id: ping-pong").unwrap();
+    let binary = body.find("binary: /x/ping-pong-rs").unwrap();
+    let restart = body.find("restart: on-failure").unwrap();
+    let max = body.find("max_restarts: 5").unwrap();
+    assert!(id < binary && binary < restart && restart < max);
+}
+
+// linux render keeps the sandbox line — pins the kernel-facing format
+#[test]
+fn render_dropin_with_sandbox_includes_flag() {
+    let p = params("ping-pong", "/x/ping-pong-rs");
+    let body = render_dropin(&p, true);
+    assert!(body.contains("sandbox: true"));
 }
 
 // existing drop-in is left untouched (operator-tuned), and the write

@@ -16,7 +16,7 @@ use crate::registry::{
     RegistryEntry,
 };
 use crate::source::RegistrySource;
-use crate::state::{load_state, record_install, InstalledEntry};
+use crate::state::{load_state, record_install, InstalledEntry, PreviousInstall};
 use vynkor_wire::manifest::{validate_manifest, InstallManifest};
 
 /// What `install` placed on disk, so the caller can write a per-plugin
@@ -370,11 +370,38 @@ fn commit_staged(
     }
 
     let bak = plugin_base.join(format!("{slug}.bak"));
+    let prev_dir = plugin_base.join(format!("{slug}.prev"));
     let had_existing = dest.exists();
 
+    // Snapshot the ledger record this install is about to demote, BEFORE the
+    // swap (roadmap parked item — the metadata half of `vynm rollback`). Flat
+    // (one hop) by design: the demoted entry's own `previous` is dropped so
+    // the new record points at a clean single hop. Fresh installs capture
+    // nothing.
+    let previous: Option<PreviousInstall> = if had_existing {
+        load_state(tmp_dir)
+            .get(slug)
+            .map(|demoted| PreviousInstall {
+                version: demoted.version.clone(),
+                sha256: demoted.sha256.clone(),
+                installed_at: demoted.installed_at,
+                source_url: demoted.source_url.clone(),
+                source: demoted.source.clone(),
+                tree_sha256: demoted.tree_sha256.clone(),
+            })
+    } else {
+        None
+    };
+
     if had_existing {
+        // stale-bak (crash-window recovery) and stale-prev (roadmap parked
+        // item) are both cleared BEFORE the swap so the demoted tree always
+        // lands on a clean path.
         if bak.exists() {
             let _ = fs::remove_dir_all(&bak);
+        }
+        if prev_dir.exists() {
+            let _ = fs::remove_dir_all(&prev_dir);
         }
         if let Err(e) = fs::rename(&dest, &bak) {
             let _ = fs::remove_dir_all(stage_dir);
@@ -390,8 +417,19 @@ fn commit_staged(
         return Err(VynmError::Io(e));
     }
 
+    // KEEP the previous tree instead of deleting the `.bak` (roadmap parked
+    // item): rename it to `<slug>.prev`, exactly the tree `vynm rollback`
+    // restores. A failed keep-rename warns but must not fail the
+    // already-successful install; the `.bak` stays for the next install's
+    // stale-bak cleanup.
     if had_existing {
-        let _ = fs::remove_dir_all(&bak);
+        if let Err(e) = fs::rename(&bak, &prev_dir) {
+            tracing::warn!(
+                "installed '{slug}' but could not retain its previous tree at {} \
+                 (rollback unavailable until the next install): {e}",
+                prev_dir.display()
+            );
+        }
     }
     let _ = fs::remove_dir_all(stage_dir);
 
@@ -412,6 +450,7 @@ fn commit_staged(
             source_url: source_url.to_string(),
             source: source_name.to_string(),
             tree_sha256,
+            previous,
         },
     )?;
 

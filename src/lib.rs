@@ -1,9 +1,12 @@
+pub mod bundle;
 pub mod cli;
 pub mod dropin;
 pub mod error;
 pub mod installer;
 pub mod keygen;
+pub mod package;
 pub mod registry;
+pub mod rollback;
 pub mod scaffold;
 pub mod sign;
 pub mod source;
