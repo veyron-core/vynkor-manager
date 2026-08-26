@@ -2,6 +2,7 @@ pub mod bundle;
 pub mod cli;
 pub mod dropin;
 pub mod error;
+pub mod init;
 pub mod installer;
 pub mod keygen;
 pub mod package;
