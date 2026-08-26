@@ -14,6 +14,7 @@ fn entry(tree: Option<&str>) -> InstalledEntry {
         source_url: "https://registry.example".into(),
         source: "official".into(),
         tree_sha256: tree.map(str::to_string),
+        previous: None,
     }
 }
 

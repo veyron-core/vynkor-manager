@@ -1,3 +1,9 @@
+//! Per-plugin auto-spawn drop-ins for the kernel (`plugins.d/<slug>.yaml`):
+//! write via `create_new` (O_EXCL — never follows a planted symlink), remove,
+//! disable/enable by rename, and uninstall. Sandbox flags are linux-only
+//! kernel semantics, so non-linux drop-ins omit the key entirely (decision
+//! recorded in vynkor/docs/VYNM_PLAN.md §10).
+
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -38,6 +44,39 @@ pub struct DropinParams<'a> {
     pub sandbox: bool,
 }
 
+/// Render the drop-in body for a plugin (pure, no I/O). `include_sandbox`
+/// selects whether the `sandbox:` line is emitted — sandbox is a linux-only
+/// kernel feature, so non-linux drop-ins omit the key entirely rather than
+/// write a value the kernel ignores there (§10 open question 2). Exposed for
+/// format-pinning integration tests that assert the exact body text.
+pub fn render_dropin(params: &DropinParams<'_>, include_sandbox: bool) -> String {
+    if include_sandbox {
+        format!(
+            "# auto-spawn entry written by `vynm install {}` — edit to tune, remove to disable\n\
+             id: {}\n\
+             binary: {}\n\
+             restart: on-failure\n\
+             max_restarts: 5\n\
+             sandbox: {}\n",
+            params.slug,
+            params.plugin_id,
+            params.binary_path.display(),
+            params.sandbox
+        )
+    } else {
+        format!(
+            "# auto-spawn entry written by `vynm install {}` — edit to tune, remove to disable\n\
+             id: {}\n\
+             binary: {}\n\
+             restart: on-failure\n\
+             max_restarts: 5\n",
+            params.slug,
+            params.plugin_id,
+            params.binary_path.display()
+        )
+    }
+}
+
 /// Write a per-plugin drop-in config `plugins_dir/<slug>.yaml` (R10-01) so the
 /// kernel auto-spawns the installed plugin. Returns whether the file was
 /// written — an existing file (operator-tuned, or a planted symlink) is left
@@ -52,18 +91,7 @@ pub fn write_plugin_config(
     fs::create_dir_all(plugins_dir).map_err(VynmError::Io)?;
     let path = plugins_dir.join(format!("{}.yaml", params.slug));
 
-    let body = format!(
-        "# auto-spawn entry written by `vynm install {}` — edit to tune, remove to disable\n\
-         id: {}\n\
-         binary: {}\n\
-         restart: on-failure\n\
-         max_restarts: 5\n\
-         sandbox: {}\n",
-        params.slug,
-        params.plugin_id,
-        params.binary_path.display(),
-        params.sandbox
-    );
+    let body = render_dropin(params, cfg!(target_os = "linux"));
     match fs::OpenOptions::new()
         .write(true)
         .create_new(true)

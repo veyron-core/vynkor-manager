@@ -260,6 +260,31 @@ pub enum CacheCmd {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum BundleCmd {
+    /// Pack installed plugin trees + a filtered ledger into ONE offline zip
+    /// (air-gapped moves; roadmap parked item). No network, ever.
+    Export {
+        /// restrict to these slugs (default: every ledger entry)
+        slugs: Vec<String>,
+        /// bundle output path (default ./vynm-bundle.zip)
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// overwrite an existing bundle file
+        #[arg(long)]
+        force: bool,
+    },
+    /// Import a bundle produced by `vynm bundle export`. Every tree is
+    /// digest-verified against the bundled ledger BEFORE anything is
+    /// committed — a tampered bundle imports nothing.
+    Import {
+        archive: PathBuf,
+        /// replace already-installed plugins of the same slug
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 pub enum Command {
     /// Install a plugin from a registry, or a local archive / direct archive
     /// URL (V-15). Ambiguity rule: an argument starting with http(s)://,
@@ -350,6 +375,15 @@ pub enum Command {
         #[command(subcommand)]
         action: CacheCmd,
     },
+    /// Restore the previous installed version kept by the last update
+    /// (roadmap parked item). The `<slug>.prev` tree's digest is checked
+    /// against the ledger BEFORE the swap; running it twice toggles back.
+    Rollback { slug: String },
+    /// Air-gapped export/import of installed plugins (roadmap parked item)
+    Bundle {
+        #[command(subcommand)]
+        action: BundleCmd,
+    },
     /// Emit shell completion scripts for vynm (V-16)
     Completions {
         /// Shell to generate the script for
@@ -417,6 +451,38 @@ pub enum Command {
         #[arg(long)]
         signature: Option<String>,
     },
+    /// Package a BUILT plugin directory into the dist/ tree + registry.json
+    /// (V-14 follow-up): zip + checksum.sha256 + signature.sig + v2 upsert.
+    /// Replaces scripts/package.sh's zip/checksum/sign/upsert steps; does NOT
+    /// run cargo build — package what already exists.
+    Package {
+        /// directory with plugin.json + the built binary
+        dir: PathBuf,
+        /// display name for the registry entry
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        description: String,
+        #[arg(long, default_value = "utility")]
+        category: String,
+        /// comma-separated tags
+        #[arg(long, value_delimiter = ',')]
+        tags: Vec<String>,
+        #[arg(long, default_value = "stable")]
+        status: String,
+        /// source URL recorded on the registry entry
+        #[arg(long, default_value = "")]
+        source_url: String,
+        /// hex-seed key file (`vynm keygen`); omit for an unsigned entry
+        #[arg(long)]
+        key: Option<PathBuf>,
+        /// root holding dist/ and registry.json (default: current dir)
+        #[arg(long)]
+        repo_root: Option<PathBuf>,
+        /// replace an existing archive / overwrite the registered version
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 /// Dispatch a parsed invocation; errors bubble to main for exit-code mapping.
@@ -454,6 +520,34 @@ pub async fn run(cli: &Cli) -> Result<(), VynmError> {
                 public_key.as_deref(),
                 signature.as_deref(),
             )
+        }
+        Command::Package {
+            dir,
+            name,
+            description,
+            category,
+            tags,
+            status,
+            source_url,
+            key,
+            repo_root,
+            force,
+        } => {
+            let repo_root = repo_root
+                .clone()
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+            return crate::package::run(crate::package::PackageOpts {
+                dir,
+                repo_root: &repo_root,
+                name,
+                description,
+                category,
+                tags,
+                status,
+                source_url,
+                key: key.as_deref(),
+                force: *force,
+            });
         }
         _ => {}
     }
@@ -515,11 +609,19 @@ pub async fn run(cli: &Cli) -> Result<(), VynmError> {
         Command::Cache {
             action: CacheCmd::Clean,
         } => cache_clean_cmd(&ctx.tmp_dir),
+        Command::Rollback { slug } => crate::rollback::run(&ctx.tmp_dir, slug),
+        Command::Bundle {
+            action: BundleCmd::Export { slugs, out, force },
+        } => crate::bundle::export(&ctx.tmp_dir, out.as_deref(), *force, slugs).map(|_| ()),
+        Command::Bundle {
+            action: BundleCmd::Import { archive, force },
+        } => crate::bundle::import(&ctx.tmp_dir, &ctx.plugins_dir, archive, *force).map(|_| ()),
         Command::CompleteSlugs { source } => complete_slugs_cmd(&ctx, source.as_deref()).await,
         // all handled above, before Ctx::load
         Command::Keygen { .. }
         | Command::Sign { .. }
         | Command::New { .. }
+        | Command::Package { .. }
         | Command::Completions { .. } => Ok(()),
     }
 }

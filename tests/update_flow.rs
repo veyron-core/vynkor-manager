@@ -135,6 +135,7 @@ impl Sandbox {
                 source_url: source_url.into(),
                 source: source.into(),
                 tree_sha256: None,
+                previous: None,
             },
         )
         .unwrap();
