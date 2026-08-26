@@ -358,7 +358,7 @@ struct MapVersion {
 fn parse_registry_document(body: &str) -> Result<RegistryDocument, VynmError> {
     let shape: RegistryDocShape = serde_json::from_str(body)
         .map_err(|e| VynmError::Network(format!("parse registry JSON: {e}")))?;
-    Ok(match shape {
+    let mut doc = match shape {
         RegistryDocShape::Flat(entries) => RegistryDocument {
             meta: None,
             entries,
@@ -402,7 +402,17 @@ fn parse_registry_document(body: &str) -> Result<RegistryDocument, VynmError> {
                 entries,
             }
         }
-    })
+    };
+    // Published registries carry explicit empty `status` values (older
+    // packagers wrote "" instead of omitting the key, so serde's default
+    // never fired). Normalize at the parse boundary — the documented
+    // default lifecycle is "stable", and only "revoked" is ever enforced.
+    for entry in &mut doc.entries {
+        if entry.status.is_empty() {
+            entry.status = default_status();
+        }
+    }
+    Ok(doc)
 }
 
 /// Filter `entries` down to those whose maintainer signature verifies (T-11),
