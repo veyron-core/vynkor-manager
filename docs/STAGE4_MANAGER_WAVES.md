@@ -8,7 +8,7 @@ experience docs (V-03…V-06).
 
 | Command | Key decisions |
 |---|---|
-| `vynm keygen` | OS RNG via `getrandom 0.2` (already in lockfile — zero new versions). Secret file created with `O_EXCL` + `0o600` from the FIRST open (no truncate-in-place race); `--force` removes+recreates. Format = bare 64-hex seed, byte-compatible with the `VEYRON_SIGNING_KEY_HEX` convention so package.sh interop survives. Optional positional `[name]` resolves the default key filename. |
+| `vynm keygen` | OS RNG via `getrandom 0.2` (already in lockfile — zero new versions). Secret file created with `O_EXCL` + `0o600` from the FIRST open (no truncate-in-place race); `--force` removes+recreates. Format = bare 64-hex seed, byte-compatible with the `VYN_SIGNING_KEY_HEX` convention so package.sh interop survives. Optional positional `[name]` resolves the default key filename. |
 | `vynm sign` | Entry-level S1 signing. The message is NEVER formatted locally: the command constructs a `RegistryEntry` and calls `registry::signed_message()` — single source of truth, pinned by a literal-string test. Defaults `--status stable`, `--max *`. `--verify --public-key --signature` reuses `verify_entry_signature`; tamper exits **3** (verification class, scripting contract). |
 | `vynm new <name>` | Templates embedded via `include_str!` (`templates/new/*`) with a single `{{name}}` substitution — zero new deps, offline-first. Name gated by `validate_identifier`; refuses existing dir without `--force`. Acceptance test builds the scaffold against the PUBLISHED `vynkor-sdk` (network-dependent → `#[ignore]` for CI). |
 

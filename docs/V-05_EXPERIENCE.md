@@ -6,12 +6,12 @@ three repos: two tiny wire releases first (prerequisites), then the port.
 
 ## Prerequisite wire cycles (shipped first)
 
-1. **wire 0.2.5** (`PR veyron-wire#7`): `InstallManifest.sandbox: Option<bool>`
+1. **wire 0.2.5** (`PR vynkor-wire#7`): `InstallManifest.sandbox: Option<bool>`
    — D3 needs the plugin's own hint readable through the single shared
    manifest type; real plugin.json documents adopt the key separately.
    Also carried a repo-license move to dual MIT/Apache (repo owner's pending
    working-tree change; split into its own `chore(license)` commit).
-2. **wire 0.2.6** (`PR veyron-wire#8` + kernel `PR #42`):
+2. **wire 0.2.6** (`PR vynkor-wire#8` + kernel `PR #42`):
    `validate_manifest(path, kernel_ver: Option<&Version>, resolver)`.
    D2 says vynm must never guess the running kernel's version — so when no
    authoritative version is available (kernel unreachable), `None` skips the
@@ -24,7 +24,7 @@ three repos: two tiny wire releases first (prerequisites), then the port.
 |---|---|
 | `src/installer.rs` | NEW — the 8-step atomic pipeline: resolve → revoke-gate → signature → download → sha256 digest → zip-slip-guarded extraction → bak/rename atomic swap → manifest validation → ledger record. |
 | `tests/installer.rs` | NEW — 17 tests: security battery ported from kernel `test_installer.rs` (digest mismatch, zip-slip ×2, exec-bit restore, entry-cap, zip-bomb, signature-before-download with mockito `expect(0)`) + end-to-end installs against mockito archives signed by a deterministic test key + D2/D3 acceptance cases. |
-| `Cargo.toml` | + `veyron-wire 0.2.6` (manifest feature), `zip 2` (deflate only), `indicatif`, `semver`. |
+| `Cargo.toml` | + `vynkor-wire 0.2.6` (manifest feature), `zip 2` (deflate only), `indicatif`, `semver`. |
 
 ## The deletions, explicitly (D2/D3)
 

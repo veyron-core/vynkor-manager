@@ -108,7 +108,7 @@ impl InstalledState {
 /// Directory holding `installed.json`. `VYNM_STATE_DIR` overrides for
 /// relocatable setups and tests; otherwise the XDG data dir, mirroring how
 /// `plugin_dir()` resolves its override then `$HOME/.local/lib`. (The kernel
-/// equivalent is `VEYRON_STATE_DIR`; the manager owns its namespace.)
+/// equivalent is `VYN_STATE_DIR`; the manager owns its namespace.)
 /// `tmp_dir` is the fallback base when `$HOME` is unset (same convention as
 /// `plugin_dir`/registry cache — never the shared `/tmp`, AUDIT M-09).
 /// §6.6: pub — stage-3 config layering must not fork path logic.

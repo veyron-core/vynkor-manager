@@ -33,10 +33,10 @@ jobs:
       # the kernel crate — an empty inverted tree must stay empty.
       - name: No kernel dependency (C2 guard)
         run: |
-          cargo tree -i veyron > /dev/null 2>&1 && {
-            echo "FAIL: vynkor-manager depends on the veyron kernel crate"
+          cargo tree -i vynkor > /dev/null 2>&1 && {
+            echo "FAIL: vynkor-manager depends on the vynkor kernel crate"
             exit 1
-          } || echo "ok: no veyron dependency"
+          } || echo "ok: no vynkor dependency"
 
       - name: Build
         run: cargo build --all-features
