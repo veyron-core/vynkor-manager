@@ -1,6 +1,6 @@
 use std::io;
 
-/// Manager-side error type. Variant set mirrors the kernel's `VeyronError`
+/// Manager-side error type. Variant set mirrors the kernel's `VynkorError`
 /// slice that the ported code needs, so ports stay mechanical and message
 /// texts survive verbatim.
 #[derive(Debug, thiserror::Error)]

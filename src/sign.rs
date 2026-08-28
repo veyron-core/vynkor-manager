@@ -10,7 +10,7 @@ use ed25519_dalek::{Signer, SigningKey};
 use crate::error::VynmError;
 use crate::registry::{hex_encode, verify_entry_signature, RegistryEntry};
 
-/// Load the bare 64-hex-char seed (`VEYRON_SIGNING_KEY_HEX` convention).
+/// Load the bare 64-hex-char seed (`VYN_SIGNING_KEY_HEX` convention).
 /// Trailing whitespace tolerated; anything else is a hard input error.
 pub fn load_signing_key(path: &Path) -> Result<SigningKey, VynmError> {
     let text = std::fs::read_to_string(path)

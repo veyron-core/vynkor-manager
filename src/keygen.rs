@@ -1,5 +1,5 @@
 //! vynm keygen (V-14a): ed25519 signing keys for registry publishers.
-//! Key format is the historical `VEYRON_SIGNING_KEY_HEX` convention —
+//! Key format is the `VYN_SIGNING_KEY_HEX` convention —
 //! a bare 64-hex-char seed, nothing else on disk or stdout.
 
 use std::path::Path;

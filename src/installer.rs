@@ -146,7 +146,7 @@ async fn preflight_kernel_version(entry: &RegistryEntry) -> Option<Version> {
         &entry.max_kernel_version,
         &kernel_ver,
     ) {
-        tracing::warn!("{e}. Upgrade Veyron before restarting the kernel.");
+        tracing::warn!("{e}. Upgrade Vynkor before restarting the kernel.");
     }
     Some(kernel_ver)
 }
