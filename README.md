@@ -1,5 +1,8 @@
 # vynkor-manager
 
+[![crates.io](https://img.shields.io/crates/v/vynkor-manager.svg)](https://crates.io/crates/vynkor-manager)
+[![CI](https://github.com/vynkor-core/vynkor-manager/actions/workflows/ci.yml/badge.svg)](https://github.com/vynkor-core/vynkor-manager/actions/workflows/ci.yml)
+
 Plugin marketplace manager for [vynkor](https://github.com/vynkor-core/vynkor).
 The binary is **`vynm`**: it installs, updates, and manages kernel plugins from
 registries.
