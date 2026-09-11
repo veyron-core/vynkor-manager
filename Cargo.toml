@@ -27,16 +27,16 @@ thiserror = "2"
 tracing = "0.1"
 # D8/TLS-bloat: no native-tls, no default features — rustls only
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-ed25519-dalek = "2"
+ed25519-dalek = "3"
 # keygen seed source (V-14a) — os rng only, no rng stack
 getrandom = "0.2"
 url = "2"
-sha2 = "0.10"
+sha2 = "0.11"
 semver = "1"
 # shared plugin-manifest parsing/validation (single implementation, V-01);
 # the no-kernel-crate rule is untouched — wire is a separate crate
 vynkor-wire = { version = "0.0.2", features = ["manifest"] }
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "8", default-features = false, features = ["deflate"] }
 indicatif = "0.18"
 clap = { version = "4", features = ["derive"] }
 # V-16 shell-completion generation (bash/zsh/fish) from the clap surface
